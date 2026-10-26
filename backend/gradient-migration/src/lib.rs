@@ -31,6 +31,7 @@ mod m20261027_000000_eval_cost_estimates;
 mod m20261028_000000_split_evaluation;
 mod m20261028_000001_task_multi_node_evaluation;
 mod m20261029_000000_eval_cost_report;
+mod m20261030_000000_eval_set_cost_max_peak_rss;
 
 pub struct UpgradeFloor {
     pub release: &'static str,
@@ -79,6 +80,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261028_000000_split_evaluation::Migration),
             Box::new(m20261028_000001_task_multi_node_evaluation::Migration),
             Box::new(m20261029_000000_eval_cost_report::Migration),
+            Box::new(m20261030_000000_eval_set_cost_max_peak_rss::Migration),
         ]
     }
 }

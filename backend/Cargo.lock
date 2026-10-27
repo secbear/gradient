@@ -2874,8 +2874,14 @@ name = "gradient-guest-agent"
 version = "2.0.1"
 dependencies = [
  "anyhow",
+ "axum",
+ "bytes",
+ "clap",
  "gradient-util",
  "gradient-wire",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "nix",
  "serde_json",
  "tempfile",
@@ -2883,6 +2889,7 @@ dependencies = [
  "tokio-util",
  "tokio-vsock",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

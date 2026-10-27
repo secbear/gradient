@@ -158,6 +158,12 @@ mod tests {
 
     fn scripted(hole: bool) -> sea_orm::DatabaseConnection {
         let n = || vec![BTreeMap::from([("n".to_owned(), Value::BigInt(Some(0)))])];
+        let locked = || {
+            vec![BTreeMap::from([(
+                "?column?".to_owned(),
+                Value::Int(Some(1)),
+            )])]
+        };
         let empty = Vec::<BTreeMap<String, Value>>::new();
         let drifted: Vec<BTreeMap<String, Value>> = (0..4)
             .map(|_| {
@@ -180,8 +186,9 @@ mod tests {
                 "derivation".to_owned(),
                 Value::from(uuid::Uuid::now_v7()),
             )])]])
-            .append_exec_results([exec(0), exec(0)])
+            .append_exec_results([exec(0)])
             .append_query_results([
+                locked(),
                 vec![BTreeMap::from([(
                     "derivation".to_owned(),
                     Value::from(uuid::Uuid::now_v7()),
@@ -191,8 +198,8 @@ mod tests {
             ])
             .append_query_results([drifted])
             .append_query_results([empty.clone(), empty.clone()])
-            .append_exec_results([exec(0), exec(5)])
-            .append_query_results([empty.clone(), empty.clone()]);
+            .append_exec_results([exec(5)])
+            .append_query_results([locked(), empty.clone(), empty.clone()]);
         db = if hole {
             db.append_query_results([vec![BTreeMap::from([(
                 "?column?".to_owned(),

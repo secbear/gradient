@@ -19,7 +19,7 @@ use gradient_types::input::vec_to_hex;
 use gradient_types::*;
 use tracing::instrument;
 
-pub use checkout::checkout_commit;
+pub use checkout::{checkout_commit, checkout_commit_into};
 pub use commit_info::HeadCommit;
 pub use remote::{BranchHead, accept_cert, fetch_options_with_ssh};
 

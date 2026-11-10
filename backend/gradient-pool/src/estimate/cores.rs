@@ -7,7 +7,7 @@
 use crate::score::{RamFit, RamNeed, WorkerMetricsView};
 
 pub fn fewer_cores(cores: u32) -> u32 {
-    cores.saturating_sub(1).min((2 * cores).div_ceil(3)).max(1)
+    cores.saturating_sub(1).min(cores - cores / 3).max(1)
 }
 
 pub fn core_steps(full: u32) -> Vec<u32> {
@@ -57,7 +57,9 @@ pub fn assess_cores(
     unmeasured_mb: u64,
     need_at: impl Fn(u32) -> RamNeed,
 ) -> CoreAssessment {
-    let full = max_cores.map_or(worker.full_cores(), |cap| cap.min(worker.full_cores()));
+    let full = max_cores
+        .map_or(worker.full_cores(), |cap| cap.min(worker.full_cores()))
+        .max(1);
     let steps = core_steps(full);
     let estimated = largest_fitting(worker, &steps, unmeasured_mb, &need_at);
     let assessment = CoreAssessment {
@@ -76,7 +78,10 @@ pub fn assess_cores(
     };
     CoreAssessment {
         choice: largest_fitting(worker, &steps, unmeasured_mb, |cores| {
-            RamNeed::Predicted((at_full * u64::from(cores)).div_ceil(u64::from(full)))
+            let scaled = (u128::from(at_full) * u128::from(cores)).div_ceil(u128::from(full));
+            RamNeed::Predicted(
+                u64::try_from(scaled).expect("a core step does not exceed the full core count"),
+            )
         }),
         memory_assumption: MemoryAssumption::Proportional,
     }
@@ -184,6 +189,39 @@ mod tests {
         let unknown = WorkerMetricsView::default();
         let choice = choose_cores(&unknown, None, 0, |_| RamNeed::Negligible);
         assert_eq!(choice.cores, 1);
+    }
+
+    #[test]
+    fn arithmetic_large_core_counts_do_not_overflow_the_step_reduction() {
+        let worker = WorkerMetricsView {
+            cpu_count: u32::MAX,
+            ram_total_mb: 8_000,
+            ram_free_mb: Some(8_000),
+            ..Default::default()
+        };
+        let choice = choose_cores(&worker, None, 0, |_| RamNeed::Predicted(1_000));
+        assert_eq!(choice.cores, u32::MAX);
+        assert_eq!(choice.fit, RamFit::Fits);
+    }
+
+    #[test]
+    fn arithmetic_large_predictions_do_not_overflow_the_proportional_fallback() {
+        let choice = choose_cores(&worker(u64::MAX / 2, u64::MAX / 2, 0), None, 0, |_| {
+            RamNeed::Predicted(u64::MAX)
+        });
+        assert_eq!(choice.cores, 29);
+        assert_eq!(choice.need, RamNeed::Predicted(8_358_680_908_399_640_576));
+        assert_eq!(choice.fit, RamFit::Fits);
+    }
+
+    #[test]
+    fn arithmetic_a_zero_core_cap_keeps_the_one_core_minimum_in_the_fallback() {
+        let choice = choose_cores(&worker(1_000, 1_000, 0), Some(0), 0, |_| {
+            RamNeed::Predicted(2_000)
+        });
+        assert_eq!(choice.cores, 1);
+        assert_eq!(choice.need, RamNeed::Predicted(2_000));
+        assert_eq!(choice.fit, RamFit::DoesNotFit);
     }
 
     #[test]

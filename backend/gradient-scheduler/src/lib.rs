@@ -9,6 +9,7 @@ mod assessment_memo;
 pub mod build;
 pub mod build_history;
 pub mod buildability;
+pub mod capacity;
 pub mod cluster;
 pub mod connection_failures;
 pub mod draining;
@@ -246,6 +247,22 @@ impl Scheduler {
         self.call(|reply| SchedulerMsg::PendingSnapshot { reply })
             .await
             .unwrap_or_default()
+    }
+
+    /// Capture local capacity for a project scope resolved by the caller's authorization boundary.
+    #[tracing::instrument(skip_all)]
+    pub async fn build_capacity_snapshot(
+        &self,
+        projects: std::collections::HashSet<ProjectId>,
+    ) -> anyhow::Result<capacity::BuildCapacitySnapshot> {
+        let instance = **self.scoring.instance.load();
+        self.call(|reply| SchedulerMsg::BuildCapacitySnapshot {
+            projects,
+            instance,
+            draining: self.draining.clone(),
+            reply,
+        })
+        .await
     }
 
     pub async fn board_active_jobs(&self) -> Vec<jobs::BoardActiveJob> {

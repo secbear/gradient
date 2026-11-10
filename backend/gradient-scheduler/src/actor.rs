@@ -370,6 +370,12 @@ pub enum SchedulerMsg {
     PendingSnapshot {
         reply: RpcReplyPort<Vec<PendingJobInfo>>,
     },
+    BuildCapacitySnapshot {
+        projects: HashSet<ProjectId>,
+        instance: InstanceContext,
+        draining: crate::draining::Draining,
+        reply: RpcReplyPort<crate::capacity::BuildCapacitySnapshot>,
+    },
     BoardActiveJobs {
         reply: RpcReplyPort<Vec<BoardActiveJob>>,
     },
@@ -569,6 +575,68 @@ impl SchedulerCore {
 
         self.ram_shortages
             .lasting(current, now, crate::ram_shortage::RAM_SHORTAGE_GRACE)
+    }
+
+    fn build_capacity_snapshot(
+        &self,
+        projects: &HashSet<ProjectId>,
+        instance: &InstanceContext,
+        server_draining: bool,
+    ) -> crate::capacity::BuildCapacitySnapshot {
+        let workers = self
+            .pool
+            .all_workers()
+            .into_iter()
+            .filter_map(|worker| {
+                let authorized = self
+                    .pool
+                    .peer_auth_for(&worker.id)
+                    .and_then(|auth| auth.as_filter())
+                    .cloned();
+                if projects.is_empty()
+                    || authorized
+                        .as_ref()
+                        .is_some_and(|peers| peers.is_disjoint(projects))
+                {
+                    return None;
+                }
+                let mut caps = self.pool.worker_caps(&worker.id)?;
+                if !caps.capabilities.build {
+                    return None;
+                }
+                let waiting = self.tracker.waiting_build(&worker.id);
+                if let Some(metrics) = caps.metrics.as_mut() {
+                    metrics.ram_reserved_for_waiting_build_mb = waiting.map_or(0, |(_, mb)| mb);
+                }
+                let waiting_build = waiting
+                    .and_then(|(key, _)| self.tracker.pending_job(key))
+                    .and_then(PendingJob::derivation_build);
+                let reserved = self.reservation.as_ref().is_some_and(|reservation| {
+                    reservation.holds(&worker.id, crate::cluster::SlotKind::Build)
+                });
+                let free_slots = if server_draining || worker.draining || reserved {
+                    0
+                } else {
+                    worker
+                        .max_concurrent_builds
+                        .saturating_sub(crate::count::clamp_to_u32(worker.assigned_build_count))
+                };
+                Some(crate::capacity::BuildCapacityWorker {
+                    id: worker.id,
+                    caps,
+                    free_slots,
+                    authorized,
+                    waiting_build,
+                })
+            })
+            .collect();
+        crate::capacity::BuildCapacitySnapshot {
+            captured_at: gradient_types::now(),
+            server_draining,
+            builds: self.tracker.ready_builds(projects),
+            workers,
+            instance: self.with_live_transfers(instance),
+        }
     }
 
     fn candidates(&mut self, worker: &str, only_new: bool) -> Offer {
@@ -1392,6 +1460,16 @@ impl Actor for CoreActor {
             SchedulerMsg::PendingSnapshot { reply } => {
                 let _ = reply.send(core.tracker.pending_snapshot());
             }
+            SchedulerMsg::BuildCapacitySnapshot {
+                projects,
+                instance,
+                draining,
+                reply,
+            } => {
+                let server_draining = draining.is_draining().await;
+                let _ =
+                    reply.send(core.build_capacity_snapshot(&projects, &instance, server_draining));
+            }
             SchedulerMsg::BoardActiveJobs { reply } => {
                 let _ = reply.send(core.tracker.board_active_jobs());
             }
@@ -1492,6 +1570,35 @@ mod tests {
         match core.assign(worker, &JobKind::Build, &InstanceContext::default()) {
             AssignOutcome::Assigned(a) => Some(a.job_id().to_owned()),
             _ => None,
+        }
+    }
+
+    #[test]
+    fn capacity_snapshots_exclude_slots_reserved_for_cluster_builds_but_not_evaluations() {
+        use crate::cluster::{Placement, Reservation, Seat, SlotKind};
+        use gradient_types::ids::ClusterJobId;
+
+        let mut core = core_with_a_128_gb_worker();
+        let key = pending_heavy_build(&mut core, 1_000);
+        let projects = HashSet::from([core.tracker.pending_job(&key).unwrap().project_id()]);
+        for (kind, expected) in [(SlotKind::Build, 0), (SlotKind::Eval, 32)] {
+            core.reservation = Some(Reservation {
+                placement: Placement {
+                    cluster: ClusterJobId::now_v7(),
+                    seats: vec![Seat {
+                        member: 0,
+                        worker: "w1".into(),
+                    }],
+                },
+                kinds: vec![kind],
+                since: std::time::Instant::now(),
+            });
+            let snapshot =
+                core.build_capacity_snapshot(&projects, &InstanceContext::default(), false);
+            assert_eq!(snapshot.builds.len(), 1);
+            assert_eq!(snapshot.workers[0].free_slots, expected);
+            assert!(core.reservation.is_some());
+            assert_eq!(core.tracker.pending_count(), 1);
         }
     }
 

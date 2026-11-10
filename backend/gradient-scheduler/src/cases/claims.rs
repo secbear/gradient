@@ -27,6 +27,7 @@ use super::{
 use crate::actor::Offer;
 use crate::jobs::Assignment;
 use crate::test_jobs::{RESTRICTED_WORKER, TRUSTED_KEY, TrustedSubstitutionsOnly};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 const W1: &str = "w1";
@@ -2169,5 +2170,267 @@ async fn c31_a_restricted_worker_takes_only_substitutions_its_job_policy_allows(
         "after 3: result.job_id"
     );
     case.check("step 3").await;
+    case.finish().await;
+}
+
+#[tokio::test]
+async fn c32_capacity_snapshots_follow_ready_work_and_assigned_build_slots_without_dispatching() {
+    let evaluation = EvaluationId::now_v7();
+    let evaluating = EvaluationId::now_v7();
+    let case = SchedulerCase::start(
+        shape()
+            .two(evaluation)
+            .startable(C, C_OUT)
+            .evalq(evaluating),
+    )
+    .await;
+    let project = case.db.project_of(evaluation).await;
+    let scope = HashSet::from([project]);
+    case.connect(W1, w_all().slots(2).cpus(8).ram_total_mb(32_000), &[])
+        .await;
+    case.admit_startable_moves().await;
+    case.assign_queued_evals().await;
+    case.offers_full(W1).await;
+    case.score_all(W1).await;
+    case.request_job(W1, JobKind::Flake).await.unwrap();
+
+    let before = case.totals().await;
+    let snapshot = case
+        .scheduler
+        .build_capacity_snapshot(scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.builds.len(), 3);
+    assert_eq!(snapshot.workers.len(), 1);
+    assert_eq!(snapshot.workers[0].free_slots, 2);
+    for build in &snapshot.builds {
+        assert!(snapshot.assess(build, &snapshot.workers[0]).is_some());
+    }
+    assert_eq!(case.totals().await, before);
+    case.check("assessment leaves jobs pending").await;
+
+    case.offers_full(W1).await;
+    case.score_all(W1).await;
+    let taken = case.request_job(W1, JobKind::Build).await.unwrap();
+    let next = case
+        .scheduler
+        .build_capacity_snapshot(scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(next.builds.len(), 2);
+    assert_eq!(next.workers[0].free_slots, 1);
+    assert_eq!(snapshot.builds.len(), 3);
+    assert_eq!(snapshot.workers[0].free_slots, 2);
+    assert_eq!(case.active(taken.job_id()).await.as_deref(), Some(W1));
+    case.check("snapshot reflects the assignment before a building report")
+        .await;
+
+    case.offers_full(W1).await;
+    case.score_all(W1).await;
+    case.request_job(W1, JobKind::Build).await.unwrap();
+    let busy = case
+        .scheduler
+        .build_capacity_snapshot(scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(busy.builds.len(), 1);
+    assert_eq!(busy.workers[0].free_slots, 0);
+    case.check("a busy capable worker does not hide ready backlog")
+        .await;
+
+    case.draining(W1).await;
+    let draining = case
+        .scheduler
+        .build_capacity_snapshot(scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(draining.workers[0].free_slots, 0);
+    case.disconnect(W1).await;
+    let disconnected = case.scheduler.build_capacity_snapshot(scope).await.unwrap();
+    assert!(disconnected.workers.is_empty());
+    case.finish().await;
+}
+
+#[tokio::test]
+async fn c33_capacity_assessment_respects_project_scope_and_the_worker_job_policy() {
+    let (first, second) = (EvaluationId::now_v7(), EvaluationId::now_v7());
+    let case = SchedulerCase::start_with_job_policy(
+        shape().one(first, A, A_OUT).one(second, B, B_OUT),
+        Arc::new(TrustedSubstitutionsOnly),
+    )
+    .await;
+    let (p1, p2) = (
+        case.db.project_of(first).await,
+        case.db.project_of(second).await,
+    );
+    case.connect(
+        RESTRICTED_WORKER,
+        w_all().cpus(4).ram_total_mb(16_000),
+        &[p1],
+    )
+    .await;
+    case.connect(W2, w_all().cpus(4).ram_total_mb(16_000), &[p2])
+        .await;
+    case.admit_startable_moves().await;
+
+    let denied = case
+        .scheduler
+        .build_capacity_snapshot(HashSet::from([p1]))
+        .await
+        .unwrap();
+    assert_eq!(denied.builds.len(), 1);
+    assert_eq!(denied.workers.len(), 1);
+    assert_eq!(denied.workers[0].id, RESTRICTED_WORKER);
+    assert!(
+        denied
+            .assess(&denied.builds[0], &denied.workers[0])
+            .is_none()
+    );
+
+    let allowed = case
+        .scheduler
+        .build_capacity_snapshot(HashSet::from([p2]))
+        .await
+        .unwrap();
+    assert_eq!(allowed.builds.len(), 1);
+    assert_eq!(allowed.workers.len(), 1);
+    assert_eq!(allowed.workers[0].id, W2);
+    assert!(
+        allowed
+            .assess(&allowed.builds[0], &allowed.workers[0])
+            .is_some()
+    );
+    assert!(
+        allowed
+            .assess(&denied.builds[0], &allowed.workers[0])
+            .is_none()
+    );
+
+    let empty = case
+        .scheduler
+        .build_capacity_snapshot(HashSet::new())
+        .await
+        .unwrap();
+    assert!(empty.builds.is_empty() && empty.workers.is_empty());
+    case.check("assessment does not assign or claim jobs").await;
+    case.finish().await;
+}
+
+#[tokio::test]
+async fn c34_capacity_snapshots_count_shared_ready_builds_once_and_exclude_blocked_dependencies() {
+    let (first, second) = (EvaluationId::now_v7(), EvaluationId::now_v7());
+    let case = SchedulerCase::start(shape().chain(first).one(second, B, B_OUT)).await;
+    case.admit_startable_moves().await;
+    let scope = HashSet::from([
+        case.db.project_of(first).await,
+        case.db.project_of(second).await,
+    ]);
+    let snapshot = case
+        .scheduler
+        .build_capacity_snapshot(scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.builds.len(), 1);
+    assert_eq!(snapshot.builds[0].id, case.sb(B).await.id);
+    assert_eq!(case.sb(A).await.status, BuildStatus::Created);
+    assert!(snapshot.workers.is_empty());
+    case.check("shared ready work is not duplicated by evaluation membership")
+        .await;
+
+    case.connect(W1, w_all(), &[]).await;
+    case.offers_full(W1).await;
+    case.score_all(W1).await;
+    let dependency = case.request_job(W1, JobKind::Build).await.unwrap();
+    case.report_building(W1, dependency.job_id()).await;
+    case.commit_nar(output_nar(B, B_OUT)).await;
+    case.complete(
+        W1,
+        dependency.job_id(),
+        dependency.assignment_id(),
+        vec![span(JobPhase::Build, 0, 1000)],
+        1000,
+    )
+    .await;
+    case.admit_startable_moves().await;
+    let ready = case.scheduler.build_capacity_snapshot(scope).await.unwrap();
+    assert_eq!(ready.builds.len(), 1);
+    assert_eq!(ready.builds[0].id, case.sb(A).await.id);
+    let parent = case
+        .scheduler
+        .pending_job(&case.key(A).await)
+        .await
+        .unwrap();
+    assert!(parent.dependency_count() > 0);
+    case.check("a resolved dependency edge does not exclude ready work")
+        .await;
+    case.finish().await;
+}
+
+#[tokio::test]
+async fn c35_capacity_snapshots_exclude_native_transfers() {
+    for download in [false, true] {
+        let evaluation = EvaluationId::now_v7();
+        let seed = if download {
+            shape()
+                .one(evaluation, A, A_OUT)
+                .system("builtin")
+                .fixed_output()
+        } else {
+            shape().passthrough(evaluation)
+        };
+        let case = SchedulerCase::start(seed).await;
+        case.admit_startable_moves().await;
+        assert!(case.totals().await.pending > 0);
+        let snapshot = case
+            .scheduler
+            .build_capacity_snapshot(HashSet::from([case.db.project_of(evaluation).await]))
+            .await
+            .unwrap();
+        assert!(snapshot.builds.is_empty());
+        case.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn c36_capacity_snapshot_errors_are_not_an_empty_demand_snapshot() {
+    let evaluation = EvaluationId::now_v7();
+    let case = SchedulerCase::start(shape().one(evaluation, A, A_OUT)).await;
+    let core = case.core.lock().unwrap().clone();
+    core.stop_and_wait(None, None).await.unwrap();
+    assert!(
+        case.scheduler
+            .build_capacity_snapshot(HashSet::from([case.db.project_of(evaluation).await,]))
+            .await
+            .is_err()
+    );
+    let new = case.scheduler.spawn_core(None).await.unwrap();
+    *case.core.lock().unwrap() = new;
+    case.finish().await;
+}
+
+#[tokio::test]
+async fn c37_capacity_snapshots_distinguish_server_draining_from_missing_workers() {
+    let evaluation = EvaluationId::now_v7();
+    let case = SchedulerCase::start(shape().two(evaluation)).await;
+    let scope = HashSet::from([case.db.project_of(evaluation).await]);
+    case.connect(W1, w_all().slots(2), &[]).await;
+    case.admit_startable_moves().await;
+    case.drain_server(true).await;
+
+    let paused = case
+        .scheduler
+        .build_capacity_snapshot(scope.clone())
+        .await
+        .unwrap();
+    assert!(paused.server_draining);
+    assert_eq!(paused.builds.len(), 2);
+    assert_eq!(paused.workers[0].free_slots, 0);
+
+    case.drain_server(false).await;
+    let resumed = case.scheduler.build_capacity_snapshot(scope).await.unwrap();
+    assert!(!resumed.server_draining);
+    assert_eq!(resumed.workers[0].free_slots, 2);
+    case.check("capacity assessment preserves the drain lifecycle")
+        .await;
     case.finish().await;
 }

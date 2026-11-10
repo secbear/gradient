@@ -25,6 +25,20 @@ pub struct CoreChoice {
     pub fit: RamFit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryAssumption {
+    Predicted,
+    Unmeasured,
+    Negligible,
+    Proportional,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreAssessment {
+    pub choice: CoreChoice,
+    pub memory_assumption: MemoryAssumption,
+}
+
 /// A build fitting no step by its estimate gets the benefit of the doubt: RAM proportional to
 /// cores picks where it starts, and out-of-memory kills take the steps down from there.
 pub fn choose_cores(
@@ -33,18 +47,39 @@ pub fn choose_cores(
     unmeasured_mb: u64,
     need_at: impl Fn(u32) -> RamNeed,
 ) -> CoreChoice {
+    assess_cores(worker, max_cores, unmeasured_mb, need_at).choice
+}
+
+/// Preserve the native core choice while exposing its memory assumption.
+pub fn assess_cores(
+    worker: &WorkerMetricsView,
+    max_cores: Option<u32>,
+    unmeasured_mb: u64,
+    need_at: impl Fn(u32) -> RamNeed,
+) -> CoreAssessment {
     let full = max_cores.map_or(worker.full_cores(), |cap| cap.min(worker.full_cores()));
     let steps = core_steps(full);
     let estimated = largest_fitting(worker, &steps, unmeasured_mb, &need_at);
+    let assessment = CoreAssessment {
+        choice: estimated,
+        memory_assumption: match estimated.need {
+            RamNeed::Predicted(_) => MemoryAssumption::Predicted,
+            RamNeed::Unmeasured => MemoryAssumption::Unmeasured,
+            RamNeed::Negligible => MemoryAssumption::Negligible,
+        },
+    };
     if estimated.fit != RamFit::DoesNotFit {
-        return estimated;
+        return assessment;
     }
     let RamNeed::Predicted(at_full) = need_at(full) else {
-        return estimated;
+        return assessment;
     };
-    largest_fitting(worker, &steps, unmeasured_mb, |cores| {
-        RamNeed::Predicted((at_full * u64::from(cores)).div_ceil(u64::from(full)))
-    })
+    CoreAssessment {
+        choice: largest_fitting(worker, &steps, unmeasured_mb, |cores| {
+            RamNeed::Predicted((at_full * u64::from(cores)).div_ceil(u64::from(full)))
+        }),
+        memory_assumption: MemoryAssumption::Proportional,
+    }
 }
 
 fn largest_fitting(
@@ -149,5 +184,53 @@ mod tests {
         let unknown = WorkerMetricsView::default();
         let choice = choose_cores(&unknown, None, 0, |_| RamNeed::Negligible);
         assert_eq!(choice.cores, 1);
+    }
+
+    #[test]
+    fn assessment_identifies_the_memory_assumption_and_selected_resources() {
+        for (total, free, unmeasured, need, expected, cores, reserved) in [
+            (
+                8_000,
+                8_000,
+                0,
+                RamNeed::Predicted(1_000),
+                MemoryAssumption::Predicted,
+                64,
+                RamNeed::Predicted(1_000),
+            ),
+            (
+                8_000,
+                8_000,
+                2_000,
+                RamNeed::Unmeasured,
+                MemoryAssumption::Unmeasured,
+                64,
+                RamNeed::Unmeasured,
+            ),
+            (
+                8_000,
+                8_000,
+                0,
+                RamNeed::Negligible,
+                MemoryAssumption::Negligible,
+                64,
+                RamNeed::Negligible,
+            ),
+            (
+                60_000,
+                60_000,
+                0,
+                RamNeed::Predicted(100_000),
+                MemoryAssumption::Proportional,
+                29,
+                RamNeed::Predicted(45_313),
+            ),
+        ] {
+            let worker = worker(total, free, 0);
+            let assessment = assess_cores(&worker, None, unmeasured, |_| need);
+            assert_eq!(assessment.memory_assumption, expected);
+            assert_eq!(assessment.choice.cores, cores);
+            assert_eq!(assessment.choice.need, reserved);
+        }
     }
 }

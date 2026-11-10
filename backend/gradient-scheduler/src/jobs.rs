@@ -467,8 +467,11 @@ pub(crate) fn visible_to(
     authorized: Option<&HashSet<ProjectId>>,
     caps: Option<&WorkerCaps>,
 ) -> bool {
-    authorized.is_none_or(|peers| peers.contains(&job.project_id()))
-        && job_eligible_for_caps(job, caps)
+    authorized_for(job.project_id(), authorized) && job_eligible_for_caps(job, caps)
+}
+
+pub(crate) fn authorized_for(project: ProjectId, authorized: Option<&HashSet<ProjectId>>) -> bool {
+    authorized.is_none_or(|peers| peers.contains(&project))
 }
 
 fn wins(sc: &ScoredCandidate) -> bool {
@@ -1043,14 +1046,19 @@ impl JobTracker {
         worker_id: &str,
         mut worker_ctx: WorkerContext<'a>,
     ) -> WorkerContext<'a> {
-        if let (Some(metrics), Some(waiting)) = (
-            worker_ctx.metrics.as_mut(),
-            self.waiting_builds.get(worker_id),
-        ) {
-            metrics.ram_reserved_for_waiting_build_mb = waiting.ram_mb;
+        if let (Some(metrics), Some((_, ram_mb))) =
+            (worker_ctx.metrics.as_mut(), self.waiting_build(worker_id))
+        {
+            metrics.ram_reserved_for_waiting_build_mb = ram_mb;
         }
 
         worker_ctx
+    }
+
+    pub(crate) fn waiting_build(&self, worker_id: &str) -> Option<(&str, u64)> {
+        self.waiting_builds
+            .get(worker_id)
+            .map(|waiting| (waiting.job_id.as_str(), waiting.ram_mb))
     }
 
     fn choose_waiting_build(
@@ -1938,6 +1946,32 @@ impl JobTracker {
 
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    pub(crate) fn ready_builds(
+        &self,
+        projects: &HashSet<ProjectId>,
+    ) -> Vec<crate::capacity::ReadyBuild> {
+        self.pending
+            .values()
+            .filter_map(|job| match job {
+                PendingJob::Build(build)
+                    if build.job.build.kind == BuildSpecKind::Build
+                        && projects.contains(&build.project_id) =>
+                {
+                    Some(crate::capacity::ReadyBuild {
+                        id: build.derivation_build,
+                        project: build.project_id,
+                        requirement: build.job.requirement.clone(),
+                        is_fixed_output: build.job.build.is_fixed_output,
+                        prefer_local_build: build.prefer_local_build,
+                        ready_at: build.ready_at,
+                        estimate: build.estimate.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn pending_snapshot(&self) -> Vec<PendingJobInfo> {

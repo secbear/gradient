@@ -6,7 +6,7 @@
 
 use std::sync::LazyLock;
 
-use crate::estimate::{BuildEstimate, CoreChoice, NO_ESTIMATE, choose_cores};
+use crate::estimate::{BuildEstimate, CoreAssessment, CoreChoice, NO_ESTIMATE, assess_cores};
 use crate::score::context::{InstanceContext, RamNeed, ScoredJob, WorkerMetricsView};
 
 static DEFAULT_JOB: LazyLock<ScoredJob<'static>> = LazyLock::new(|| {
@@ -68,12 +68,20 @@ impl<'a> JobContext<'a> {
     }
 
     pub fn core_choice(&self, worker: &WorkerMetricsView, unmeasured_mb: u64) -> CoreChoice {
+        self.core_assessment(worker, unmeasured_mb).choice
+    }
+
+    pub fn core_assessment(
+        &self,
+        worker: &WorkerMetricsView,
+        unmeasured_mb: u64,
+    ) -> CoreAssessment {
         let Some(build) = self.job.build() else {
-            return choose_cores(worker, None, unmeasured_mb, |_| RamNeed::Negligible);
+            return assess_cores(worker, None, unmeasured_mb, |_| RamNeed::Negligible);
         };
         let estimate = self.build_estimate();
         let substitution = self.outputs_present || self.substitute_outputs.is_some();
-        choose_cores(worker, estimate.max_cores, unmeasured_mb, |cores| {
+        assess_cores(worker, estimate.max_cores, unmeasured_mb, |cores| {
             RamNeed::of_build(estimate.ram_mb(cores), substitution, build.is_fetch())
         })
     }

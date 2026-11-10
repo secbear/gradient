@@ -7,8 +7,8 @@
 use gradient_types::input::check_repository_url_is_ssh;
 
 use gradient_wire::types::{
-    BuildJob, BuildSpecKind, DeviceClass, ExecInventory, ExecRequirement, FlakeJob, FlakeSource,
-    FlakeStep, JobKind, ResourceAmount,
+    BuildJob, BuildRequirement, BuildSpecKind, DeviceClass, ExecInventory, ExecRequirement,
+    FlakeJob, FlakeSource, FlakeStep, JobKind, ResourceAmount,
 };
 
 use crate::exec_fit::ExecFit;
@@ -89,13 +89,19 @@ impl WorkerCaps {
     }
 
     pub fn can_run_build(&self, job: &BuildJob) -> bool {
-        let needs_network = build_needs_network(job.build.kind, job.build.is_fixed_output);
-        let only_transfers = job.build.kind != BuildSpecKind::Build;
+        self.can_run_build_kind(&job.requirement, job.build.kind, job.build.is_fixed_output)
+    }
+
+    pub fn can_run_build_kind(
+        &self,
+        requirement: &BuildRequirement,
+        kind: BuildSpecKind,
+        is_fixed_output: bool,
+    ) -> bool {
+        let needs_network = build_needs_network(kind, is_fixed_output);
+        let only_transfers = kind != BuildSpecKind::Build;
         let runs_here = only_transfers
-            || self.can_build(
-                &job.requirement.architecture,
-                &job.requirement.required_features,
-            );
+            || self.can_build(&requirement.architecture, &requirement.required_features);
         runs_here && (!needs_network || self.capabilities.network)
     }
 

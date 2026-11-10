@@ -2434,3 +2434,75 @@ async fn c37_capacity_snapshots_distinguish_server_draining_from_missing_workers
         .await;
     case.finish().await;
 }
+
+#[tokio::test]
+async fn c38_prospective_capacity_uses_the_worker_job_policy_without_connecting_workers() {
+    use crate::capacity::BuildCapacityProfile;
+    use gradient_pool::WorkerProfile;
+    use gradient_wire::types::GradientCapabilities;
+
+    let evaluation = EvaluationId::now_v7();
+    let case = SchedulerCase::start_with_job_policy(
+        shape().one(evaluation, A, A_OUT),
+        Arc::new(TrustedSubstitutionsOnly),
+    )
+    .await;
+    case.admit_startable_moves().await;
+    let project = case.db.project_of(evaluation).await;
+    let make_profile = |name: &str, worker: &str| BuildCapacityProfile {
+        name: name.into(),
+        worker_id: worker.into(),
+        capabilities: GradientCapabilities {
+            build: true,
+            ..Default::default()
+        },
+        resources: WorkerProfile {
+            architectures: vec![X86.into()],
+            cpu_count: 4,
+            ram_total_mb: 8_000,
+            max_concurrent_builds: 2,
+            ..Default::default()
+        },
+    };
+    let before = case.totals().await;
+    let assessment = case
+        .scheduler
+        .assess_build_capacity(
+            HashSet::from([project]),
+            vec![
+                make_profile("preferred", RESTRICTED_WORKER),
+                make_profile("restricted", W1),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(assessment.snapshot.builds.len(), 1);
+    assert!(assessment.snapshot.workers.is_empty());
+    assert_eq!(assessment.profiles.len(), 2);
+    assert_eq!(assessment.profiles[0].name, "preferred");
+    assert_eq!(assessment.profiles[1].name, "restricted");
+    let build = &assessment.snapshot.builds[0];
+    assert!(
+        assessment
+            .assess_profile(build, &assessment.profiles[0])
+            .is_none()
+    );
+    assert!(
+        assessment
+            .assess_profile(build, &assessment.profiles[1])
+            .is_some()
+    );
+    let mut outside = build.clone();
+    outside.project = gradient_types::ProjectId::now_v7();
+    assert!(
+        assessment
+            .assess_profile(&outside, &assessment.profiles[1])
+            .is_none()
+    );
+    assert_eq!(case.totals().await, before);
+    assert!(case.scheduler.workers_info().await.is_empty());
+    assert!(case.assignments(&case.key(A).await).await.is_empty());
+    case.check("prospective profiles neither connect workers nor claim builds")
+        .await;
+    case.finish().await;
+}

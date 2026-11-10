@@ -27,6 +27,7 @@
 , gitRev ? null
 }:
 let
+  version = "2.0.1";
   testStore = import ../scripts/store.nix { inherit pkgs; };
 
   unfilteredRoot = ../../backend;
@@ -123,11 +124,28 @@ let
     # That pass would cost six minutes for nothing here.
     buildPhaseCargoCommand = "cargoWithProfile build $cargoExtraArgs";
   });
+
+  testArgs = commonArgs // {
+    inherit version;
+    cargoArtifacts = testArtifacts;
+    CARGO_PROFILE = "test";
+    cargoNextestExtraArgs = "--no-fail-fast";
+    doInstallCargoArtifacts = false;
+
+    nativeCheckInputs = [ cacert e2fsprogs git postgresql_18 postgresqlTestHook ];
+    postgresqlTestUserOptions = "LOGIN CREATEDB";
+    postgresqlExtraSettings = ''
+      fsync = off
+      max_connections = 500
+    '';
+    preCheck = ''
+      ln -s ${testStore} ./test-store
+    '';
+  };
 in
 craneLib.buildPackage (commonArgs // lib.optionalAttrs (gitRev != null) { GRADIENT_GIT_REV = gitRev; } // rec {
-  inherit cargoArtifacts;
+  inherit cargoArtifacts version;
   pname = "gradient";
-  version = "2.0.1";
   separateDebugInfo = true;
 
   # `separateDebugInfo` is exporting `NIX_RUSTFLAGS=-g -C strip=none` for the whole derivation.
@@ -155,26 +173,15 @@ craneLib.buildPackage (commonArgs // lib.optionalAttrs (gitRev != null) { GRADIE
       doInstallCargoArtifacts = false;
     });
 
-    tests = craneLib.cargoNextest (commonArgs // {
-      inherit version;
-      cargoArtifacts = testArtifacts;
-      CARGO_PROFILE = "test";
-      cargoNextestExtraArgs = "--no-fail-fast";
-      doInstallCargoArtifacts = false;
-
-      nativeCheckInputs = [ cacert e2fsprogs git postgresql_18 postgresqlTestHook ];
-      postgresqlTestUserOptions = "LOGIN CREATEDB";
-      postgresqlExtraSettings = ''
-        fsync = off
-        max_connections = 500
-      '';
-      preCheck = ''
-        ln -s ${testStore} ./test-store
-      '';
-
+    tests = craneLib.cargoNextest (testArgs // {
       postCheck = ''
         cargoWithProfile test --doc $cargoExtraArgs
       '';
+    });
+
+    capacityTests = craneLib.cargoNextest (testArgs // {
+      pname = "gradient-capacity-tests";
+      cargoNextestExtraArgs = "--no-fail-fast --test-threads 2 --package gradient-pool --package gradient-scheduler -E 'package(gradient-pool) | test(capacity)'";
     });
   };
 

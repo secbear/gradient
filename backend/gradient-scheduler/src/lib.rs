@@ -265,6 +265,22 @@ impl Scheduler {
         .await
     }
 
+    /// Assess prospective builder profiles without registering workers or reserving capacity.
+    #[tracing::instrument(skip_all)]
+    pub async fn assess_build_capacity(
+        &self,
+        projects: std::collections::HashSet<ProjectId>,
+        profiles: Vec<capacity::BuildCapacityProfile>,
+    ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
+        capacity::BuildCapacityProfile::validate_all(&profiles)?;
+        let snapshot = self.build_capacity_snapshot(projects.clone()).await?;
+        let profiles = profiles
+            .into_iter()
+            .map(|profile| profile.prospective_worker(&projects, &self.job_policy))
+            .collect();
+        Ok(capacity::BuildCapacityAssessment { snapshot, profiles })
+    }
+
     pub async fn board_active_jobs(&self) -> Vec<jobs::BoardActiveJob> {
         self.call(|reply| SchedulerMsg::BoardActiveJobs { reply })
             .await

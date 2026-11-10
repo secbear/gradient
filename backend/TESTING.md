@@ -10,6 +10,7 @@ Details in `docs/src/contributors/tests.md`.
 ## Running
 
 - Backend tests: `nix build .#checks.x86_64-linux.unittest`, nextest on a throwaway Postgres 18.
+- Capacity checks: `nix build .#checks.x86_64-linux.gradient-capacity`, pool and capacity tests on disposable Postgres with two test threads.
 - Local `cargo test` and `cargo nextest` over the whole workspace exceed the memory of a typical workstation.
 - Local checks before a commit: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check`.
 

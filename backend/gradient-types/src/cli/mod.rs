@@ -70,10 +70,36 @@ pub use upload::UploadArgs;
 #[cfg(test)]
 mod tests {
     use crate::Cli;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn arguments_are_unique() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn oauth_client_options_remain_independent() {
+        let cli = Cli::try_parse_from([
+            "gradient",
+            "--gitea-app-client-id",
+            "forge-client",
+            "--gitea-app-client-secret-file",
+            "/forge-secret",
+            "--oidc-client-id",
+            "login-client",
+            "--oidc-client-secret-file",
+            "/login-secret",
+        ])
+        .unwrap();
+        assert_eq!(cli.gitea_app.client_id.as_deref(), Some("forge-client"));
+        assert_eq!(
+            cli.gitea_app.client_secret_file.as_deref(),
+            Some("/forge-secret")
+        );
+        assert_eq!(cli.oidc.client_id.as_deref(), Some("login-client"));
+        assert_eq!(
+            cli.oidc.client_secret_file.as_deref(),
+            Some("/login-secret")
+        );
     }
 }

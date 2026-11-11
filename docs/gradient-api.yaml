@@ -12235,7 +12235,14 @@ paths:
       tags:
       - teams
       summary: Assess local ordinary-build capacity
-      description: Needs Admin in the team. Assesses only projects granting the team its workers. This is one scheduler instance's resource snapshot, not placement or a reservation. Workers and builds have response-local indexes, not stable identities. The oldest 128 ready builds are returned with the total backlog and an explicit truncation flag; workers are never sampled. Accepts at most 16 profiles, 256 project IDs and 64 KiB. Returns 503 when capture, scan or worker limits prevent assessment. Profiles must use unregistered UUIDs; their advertised build/network capabilities are intersected with the intended registration's enable flags. Profile results are conditional on registering that exact ID under this team and satisfying worker token and project cache requirements. Profiles are alternatives, not live or starting supply. Fit does not imply a free build slot; unknown predictions and fallback reservations remain distinct. captured_at is not a metrics sample timestamp.
+      description: |-
+        Needs Admin in the team. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.
+
+        Returns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.
+
+        Prospective profiles require unregistered UUIDs and planned build/network enable flags. Tracked profiles require active, build-enabled registrations owned by this team. Saved registration flags additionally restrict their network capability. A connected tracked worker never receives a starting-profile assessment, even when it has no scoped live-worker index. All profile fits remain conditional on valid worker tokens, project caches and matching advertised resources.
+
+        include_waiting_builds adds once-only RAM credit for a waiting build in the selected batch. The credit is the native usable-budget difference, not raw reserved RAM. Fit does not imply a free slot. Unknown predictions remain distinct from fallback reservations. captured_at is not a metrics sample timestamp.
       operationId: assessTeamBuildCapacity
       parameters:
       - name: team
@@ -15848,6 +15855,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/CapacityProfileRequest'
+        tracked_profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapacityProfileRequest'
+          description: Registered team workers whose planned resources can represent capacity still starting.
+        include_waiting_builds:
+          type: boolean
+          description: Include once-only RAM credit for a waiting build in the selected batch.
       additionalProperties: false
     CapacityAssessmentResponse:
       type: object
@@ -15883,6 +15898,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/CapacityBuild'
+        tracked_workers:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrackedCapacityWorker'
     CapacityBuild:
       type: object
       required:
@@ -15918,6 +15937,13 @@ components:
             - $ref: '#/components/schemas/BuildProfileAssessment'
             - type: 'null'
           description: Entries correspond to the response's profiles, which are conditional sizing alternatives.
+        tracked_workers:
+          type: array
+          items:
+            oneOf:
+            - $ref: '#/components/schemas/BuildProfileAssessment'
+            - type: 'null'
+          description: Entries correspond to tracked_workers; connected workers never receive starting credit.
     CapacityProfileRequest:
       type: object
       required:
@@ -15934,6 +15960,19 @@ components:
           type: boolean
           description: Whether the intended registration will permit builds.
       additionalProperties: false
+    CapacityWaitingBuild:
+      type: object
+      required:
+      - build_index
+      - ram_credit_mb
+      properties:
+        build_index:
+          type: integer
+          minimum: 0
+        ram_credit_mb:
+          type: integer
+          format: int64
+          minimum: 0
     CapacityWorker:
       type: object
       required:
@@ -15949,6 +15988,10 @@ components:
           - 'null'
           format: int64
           minimum: 0
+        waiting_build:
+          oneOf:
+          - $ref: '#/components/schemas/CapacityWaitingBuild'
+          - type: 'null'
     CatalogEntry:
       type: object
       required:
@@ -22795,6 +22838,22 @@ components:
         build_count:
           type: integer
           format: int64
+    TrackedCapacityWorker:
+      type: object
+      required:
+      - profile
+      - connected
+      properties:
+        profile:
+          $ref: '#/components/schemas/BuildCapacityProfile'
+        connected:
+          type: boolean
+        worker_index:
+          type:
+          - integer
+          - 'null'
+          description: Index in workers when this connection also supplies scoped ordinary-build capacity.
+          minimum: 0
     TrafficKind:
       type: string
       enum:

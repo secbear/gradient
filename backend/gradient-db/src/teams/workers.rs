@@ -122,6 +122,21 @@ pub async fn workers_of<C: ConnectionTrait>(
         .await
 }
 
+pub async fn workers_of_ids<C: ConnectionTrait>(
+    db: &C,
+    team: TeamId,
+    workers: &[String],
+) -> Result<Vec<MTeamWorker>, DbErr> {
+    if workers.is_empty() {
+        return Ok(Vec::new());
+    }
+    ETeamWorker::find()
+        .filter(CTeamWorker::Team.eq(team))
+        .filter(CTeamWorker::WorkerId.is_in(workers.iter().cloned()))
+        .all(db)
+        .await
+}
+
 pub async fn register<C: ConnectionTrait>(
     db: &C,
     worker: MTeamWorker,

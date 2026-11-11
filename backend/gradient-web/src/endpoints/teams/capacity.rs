@@ -7,8 +7,9 @@
 use super::refusal::TeamRefusal;
 use crate::api_spec::TeamPath;
 use crate::error::{ErrorCode, WebError, WebResult};
-use crate::helpers::ok_json;
+use crate::helpers::{OptionExt, ok_json};
 use crate::refusal::SharedRefusal;
+use crate::resource::Resource;
 use crate::scope::{Admin, TeamScope};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -20,13 +21,14 @@ use gradient_scheduler::capacity::{
 };
 use gradient_types::ProjectId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 pub(crate) const REQUEST_BYTES: usize = 64 * 1024;
 const MAX_PROFILES: usize = 16;
+const MAX_TRACKED_PROFILES: usize = 256;
 const MAX_PROJECTS: usize = 256;
 const MAX_BUILDS: usize = 128;
 const MAX_WORKERS: usize = 256;
@@ -67,12 +69,34 @@ pub struct CapacityAssessmentRequest {
     /// Omit to assess all projects granting the team its workers; an empty list assesses none.
     pub projects: Option<Vec<ProjectId>>,
     pub profiles: Vec<CapacityProfileRequest>,
+    /// Registered team workers whose planned resources can represent capacity still starting.
+    #[serde(default)]
+    pub tracked_profiles: Vec<CapacityProfileRequest>,
+    /// Include once-only RAM credit for a waiting build in the selected batch.
+    #[serde(default)]
+    pub include_waiting_builds: bool,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CapacityWaitingBuild {
+    pub build_index: usize,
+    pub ram_credit_mb: u64,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct CapacityWorker {
     pub free_slots: u32,
     pub available_ram_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_build: Option<CapacityWaitingBuild>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct TrackedCapacityWorker {
+    pub profile: BuildCapacityProfile,
+    pub connected: bool,
+    /// Index in workers when this connection also supplies scoped ordinary-build capacity.
+    pub worker_index: Option<usize>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -85,6 +109,9 @@ pub struct CapacityBuild {
     pub workers: Vec<Option<BuildResourceAssessment>>,
     /// Entries correspond to the response's profiles, which are conditional sizing alternatives.
     pub profiles: Vec<Option<BuildProfileAssessment>>,
+    /// Entries correspond to tracked_workers; connected workers never receive starting credit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tracked_workers: Vec<Option<BuildProfileAssessment>>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -97,12 +124,16 @@ pub struct CapacityAssessmentResponse {
     pub workers: Vec<CapacityWorker>,
     pub profiles: Vec<BuildCapacityProfile>,
     pub builds: Vec<CapacityBuild>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tracked_workers: Vec<TrackedCapacityWorker>,
 }
 
 impl CapacityAssessmentResponse {
     fn from_assessment(
         assessment: BuildCapacityAssessment,
         profiles: Vec<BuildCapacityProfile>,
+        tracked_profiles: Vec<BuildCapacityProfile>,
+        include_waiting_builds: bool,
     ) -> Self {
         let snapshot = &assessment.snapshot;
         let builds = snapshot
@@ -123,6 +154,11 @@ impl CapacityAssessmentResponse {
                     .iter()
                     .map(|profile| assessment.assess_profile(build, profile))
                     .collect(),
+                tracked_workers: assessment
+                    .tracked_profiles
+                    .iter()
+                    .map(|profile| assessment.assess_tracked_profile(build, profile))
+                    .collect(),
             })
             .collect();
         Self {
@@ -139,10 +175,32 @@ impl CapacityAssessmentResponse {
                         .caps
                         .metrics
                         .and_then(|metrics| metrics.ram_available_mb()),
+                    waiting_build: include_waiting_builds
+                        .then(|| snapshot.waiting_build(worker))
+                        .flatten()
+                        .map(|(build_index, ram_credit_mb)| CapacityWaitingBuild {
+                            build_index,
+                            ram_credit_mb,
+                        }),
                 })
                 .collect(),
             profiles,
             builds,
+            tracked_workers: tracked_profiles
+                .into_iter()
+                .map(|profile| {
+                    let connected = snapshot.connected_workers.contains(&profile.worker_id);
+                    let worker_index = snapshot
+                        .workers
+                        .iter()
+                        .position(|worker| worker.id == profile.worker_id);
+                    TrackedCapacityWorker {
+                        profile,
+                        connected,
+                        worker_index,
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -160,7 +218,7 @@ fn unavailable() -> WebError {
     operation_id = "assessTeamBuildCapacity",
     tag = "teams",
     summary = "Assess local ordinary-build capacity",
-    description = "Needs Admin in the team. Assesses only projects granting the team its workers. This is one scheduler instance's resource snapshot, not placement or a reservation. Workers and builds have response-local indexes, not stable identities. The oldest 128 ready builds are returned with the total backlog and an explicit truncation flag; workers are never sampled. Accepts at most 16 profiles, 256 project IDs and 64 KiB. Returns 503 when capture, scan or worker limits prevent assessment. Profiles must use unregistered UUIDs; their advertised build/network capabilities are intersected with the intended registration's enable flags. Profile results are conditional on registering that exact ID under this team and satisfying worker token and project cache requirements. Profiles are alternatives, not live or starting supply. Fit does not imply a free build slot; unknown predictions and fallback reservations remain distinct. captured_at is not a metrics sample timestamp.",
+    description = "Needs Admin in the team. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.\n\nReturns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.\n\nProspective profiles require unregistered UUIDs and planned build/network enable flags. Tracked profiles require active, build-enabled registrations owned by this team. Saved registration flags additionally restrict their network capability. A connected tracked worker never receives a starting-profile assessment, even when it has no scoped live-worker index. All profile fits remain conditional on valid worker tokens, project caches and matching advertised resources.\n\ninclude_waiting_builds adds once-only RAM credit for a waiting build in the selected batch. The credit is the native usable-budget difference, not raw reserved RAM. Fit does not imply a free slot. Unknown predictions remain distinct from fallback reservations. captured_at is not a metrics sample timestamp.",
     params(TeamPath),
     request_body = CapacityAssessmentRequest,
     responses((status = OK, description = "OK", body = CapacityAssessmentResponse), WebError)
@@ -174,6 +232,7 @@ pub async fn post_team_capacity_assessment(
 ) -> WebResult<Response> {
     let permit = admission.try_acquire()?;
     if body.profiles.len() > MAX_PROFILES
+        || body.tracked_profiles.len() > MAX_TRACKED_PROFILES
         || body
             .projects
             .as_ref()
@@ -182,18 +241,8 @@ pub async fn post_team_capacity_assessment(
         return Err(TeamRefusal::CapacityRequestTooLarge.into());
     }
 
-    let mut profiles = Vec::with_capacity(body.profiles.len());
-    for request in body.profiles {
-        let mut profile = request.profile;
-        profile.worker_id = Uuid::parse_str(&profile.worker_id)
-            .map_err(|_| SharedRefusal::InvalidWorkerId)?
-            .to_string();
-        profile.capabilities.build &= request.enable_build;
-        profile.capabilities.network &= request.enable_network;
-        profiles.push(profile);
-    }
-    BuildCapacityProfile::validate_all(&profiles)
-        .map_err(|err| TeamRefusal::InvalidCapacityProfile(err.to_string()))?;
+    let profiles = requested_profiles(body.profiles)?;
+    let mut tracked_profiles = requested_profiles(body.tracked_profiles)?;
 
     let granting: HashSet<ProjectId> =
         gradient_db::teams::workers::projects_granted_with_workers(&db.web_db, team.id)
@@ -214,6 +263,34 @@ pub async fn post_team_capacity_assessment(
         return Err(unavailable());
     }
 
+    let mut tracked_ids = HashSet::new();
+    for profile in &tracked_profiles {
+        if !tracked_ids.insert(profile.worker_id.clone()) {
+            return Err(TeamRefusal::DuplicateTrackedWorker.into());
+        }
+    }
+    let tracked_rows: HashMap<_, _> = gradient_db::teams::workers::workers_of_ids(
+        &db.web_db,
+        team.id,
+        &tracked_profiles
+            .iter()
+            .map(|profile| profile.worker_id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await?
+    .into_iter()
+    .map(|worker| (worker.worker_id.clone(), worker))
+    .collect();
+    for profile in &mut tracked_profiles {
+        let registered = tracked_rows
+            .get(&profile.worker_id)
+            .or_not_found(Resource::TeamWorker)?;
+        if !registered.active || !registered.enable_build {
+            return Err(TeamRefusal::TrackedWorkerCannotBuild.into());
+        }
+        profile.capabilities.network &= registered.enable_network;
+    }
+
     let mut checked = HashSet::new();
     for profile in &profiles {
         if !checked.insert(&profile.worker_id) {
@@ -228,7 +305,35 @@ pub async fn post_team_capacity_assessment(
         }
     }
 
-    assess_capacity(scheduler, projects, profiles, permit).await
+    assess_capacity(
+        scheduler,
+        projects,
+        profiles,
+        tracked_profiles,
+        body.include_waiting_builds,
+        permit,
+    )
+    .await
+}
+
+fn requested_profiles(
+    requests: Vec<CapacityProfileRequest>,
+) -> WebResult<Vec<BuildCapacityProfile>> {
+    let profiles = requests
+        .into_iter()
+        .map(|request| {
+            let mut profile = request.profile;
+            profile.worker_id = Uuid::parse_str(&profile.worker_id)
+                .map_err(|_| SharedRefusal::InvalidWorkerId)?
+                .to_string();
+            profile.capabilities.build &= request.enable_build;
+            profile.capabilities.network &= request.enable_network;
+            Ok(profile)
+        })
+        .collect::<WebResult<Vec<_>>>()?;
+    BuildCapacityProfile::validate_all(&profiles)
+        .map_err(|err| TeamRefusal::InvalidCapacityProfile(err.to_string()))?;
+    Ok(profiles)
 }
 
 #[tracing::instrument(skip_all)]
@@ -236,6 +341,8 @@ async fn assess_capacity(
     scheduler: Arc<Scheduler>,
     projects: HashSet<ProjectId>,
     profiles: Vec<BuildCapacityProfile>,
+    tracked_profiles: Vec<BuildCapacityProfile>,
+    include_waiting_builds: bool,
     permit: OwnedSemaphorePermit,
 ) -> WebResult<Response> {
     // The task owns admission even if the HTTP request is cancelled.
@@ -243,9 +350,10 @@ async fn assess_capacity(
     shutdown
         .spawn(async move {
             let assessment = scheduler
-                .assess_build_capacity_with_limits(
+                .assess_build_capacity_with_tracked_workers(
                     projects,
                     profiles.clone(),
+                    tracked_profiles.clone(),
                     BuildCapacityLimits {
                         builds: MAX_BUILDS,
                         workers: MAX_WORKERS,
@@ -262,7 +370,10 @@ async fn assess_capacity(
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 ok_json(CapacityAssessmentResponse::from_assessment(
-                    assessment, profiles,
+                    assessment,
+                    profiles,
+                    tracked_profiles,
+                    include_waiting_builds,
                 ))
                 .into_response()
             })
@@ -301,6 +412,8 @@ mod tests {
             Arc::clone(&scheduler),
             HashSet::new(),
             vec![],
+            vec![],
+            false,
             admission.try_acquire().unwrap(),
         ));
         assert!(futures::poll!(caller.as_mut()).is_pending());

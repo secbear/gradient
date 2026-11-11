@@ -375,6 +375,7 @@ pub enum SchedulerMsg {
         instance: InstanceContext,
         draining: crate::draining::Draining,
         limits: Option<crate::capacity::BuildCapacityLimits>,
+        tracked_workers: Vec<String>,
         reply: RpcReplyPort<anyhow::Result<crate::capacity::BuildCapacitySnapshot>>,
     },
     BoardActiveJobs {
@@ -584,7 +585,13 @@ impl SchedulerCore {
         instance: &InstanceContext,
         server_draining: bool,
         limits: Option<crate::capacity::BuildCapacityLimits>,
+        tracked_workers: &[String],
     ) -> anyhow::Result<crate::capacity::BuildCapacitySnapshot> {
+        let connected_workers = tracked_workers
+            .iter()
+            .filter(|worker| self.pool.is_connected(worker))
+            .cloned()
+            .collect();
         if limits.is_some() && projects.is_empty() {
             return Ok(crate::capacity::BuildCapacitySnapshot {
                 captured_at: gradient_types::now(),
@@ -592,6 +599,7 @@ impl SchedulerCore {
                 builds: vec![],
                 total_ready_builds: 0,
                 workers: vec![],
+                connected_workers,
                 instance: *instance,
             });
         }
@@ -666,6 +674,7 @@ impl SchedulerCore {
             builds,
             total_ready_builds,
             workers,
+            connected_workers,
             instance: self.with_live_transfers(instance),
         })
     }
@@ -1496,6 +1505,7 @@ impl Actor for CoreActor {
                 instance,
                 draining,
                 limits,
+                tracked_workers,
                 reply,
             } => {
                 if reply.is_closed() {
@@ -1510,6 +1520,7 @@ impl Actor for CoreActor {
                     &instance,
                     server_draining,
                     limits,
+                    &tracked_workers,
                 ));
             }
             SchedulerMsg::BoardActiveJobs { reply } => {
@@ -1636,7 +1647,7 @@ mod tests {
                 since: std::time::Instant::now(),
             });
             let snapshot = core
-                .build_capacity_snapshot(&projects, &InstanceContext::default(), false, None)
+                .build_capacity_snapshot(&projects, &InstanceContext::default(), false, None, &[])
                 .unwrap();
             assert_eq!(snapshot.builds.len(), 1);
             assert_eq!(snapshot.workers[0].free_slots, expected);
@@ -1658,6 +1669,7 @@ mod tests {
                 &InstanceContext::default(),
                 false,
                 Some(limits),
+                &[],
             )
         };
         let limits = BuildCapacityLimits {
@@ -1718,10 +1730,11 @@ mod tests {
                 scanned_workers: usize::MAX,
                 assigned_jobs_per_worker: 0,
             }),
+            &[],
         );
         assert!(limited.is_err());
         assert!(
-            core.build_capacity_snapshot(&projects, &InstanceContext::default(), false, None)
+            core.build_capacity_snapshot(&projects, &InstanceContext::default(), false, None, &[])
                 .is_ok()
         );
     }

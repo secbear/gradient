@@ -505,6 +505,8 @@ export type CacheUpstreamId = string;
 export interface CapacityAssessmentRequest {
   projects?: ProjectId[] | null;
   profiles: CapacityProfileRequest[];
+  tracked_profiles?: CapacityProfileRequest[];
+  include_waiting_builds?: boolean;
 }
 
 export interface CapacityAssessmentResponse {
@@ -515,6 +517,7 @@ export interface CapacityAssessmentResponse {
   workers: CapacityWorker[];
   profiles: BuildCapacityProfile[];
   builds: CapacityBuild[];
+  tracked_workers?: TrackedCapacityWorker[];
 }
 
 export interface CapacityBuild {
@@ -524,6 +527,7 @@ export interface CapacityBuild {
   ready_at: string;
   workers: (BuildResourceAssessment | null)[];
   profiles: (BuildProfileAssessment | null)[];
+  tracked_workers?: (BuildProfileAssessment | null)[];
 }
 
 export interface CapacityProfileRequest {
@@ -532,9 +536,15 @@ export interface CapacityProfileRequest {
   enable_build: boolean;
 }
 
+export interface CapacityWaitingBuild {
+  build_index: number;
+  ram_credit_mb: number;
+}
+
 export interface CapacityWorker {
   free_slots: number;
   available_ram_mb?: number | null;
+  waiting_build?: CapacityWaitingBuild | null;
 }
 
 export interface CatalogEntry {
@@ -2906,6 +2916,12 @@ export interface TopProjectBuildTime {
   project_display_name: string;
   total_build_ms: number;
   build_count: number;
+}
+
+export interface TrackedCapacityWorker {
+  profile: BuildCapacityProfile;
+  connected: boolean;
+  worker_index?: number | null;
 }
 
 export type TrafficKind = "total" | "external";

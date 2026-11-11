@@ -255,12 +255,13 @@ impl Scheduler {
         &self,
         projects: std::collections::HashSet<ProjectId>,
     ) -> anyhow::Result<capacity::BuildCapacitySnapshot> {
-        self.capture_build_capacity(projects, None).await
+        self.capture_build_capacity(projects, vec![], None).await
     }
 
     async fn capture_build_capacity(
         &self,
         projects: std::collections::HashSet<ProjectId>,
+        tracked_workers: Vec<String>,
         limits: Option<capacity::BuildCapacityLimits>,
     ) -> anyhow::Result<capacity::BuildCapacitySnapshot> {
         let instance = **self.scoring.instance.load();
@@ -269,6 +270,7 @@ impl Scheduler {
             instance,
             draining: self.draining.clone(),
             limits,
+            tracked_workers,
             reply,
         })
         .await?
@@ -281,7 +283,7 @@ impl Scheduler {
         projects: std::collections::HashSet<ProjectId>,
         profiles: Vec<capacity::BuildCapacityProfile>,
     ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
-        self.capture_build_capacity_assessment(projects, profiles, None)
+        self.capture_build_capacity_assessment(projects, profiles, vec![], None)
             .await
     }
 
@@ -292,7 +294,19 @@ impl Scheduler {
         profiles: Vec<capacity::BuildCapacityProfile>,
         limits: capacity::BuildCapacityLimits,
     ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
-        self.capture_build_capacity_assessment(projects, profiles, Some(limits))
+        self.capture_build_capacity_assessment(projects, profiles, vec![], Some(limits))
+            .await
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn assess_build_capacity_with_tracked_workers(
+        &self,
+        projects: std::collections::HashSet<ProjectId>,
+        profiles: Vec<capacity::BuildCapacityProfile>,
+        tracked_profiles: Vec<capacity::BuildCapacityProfile>,
+        limits: capacity::BuildCapacityLimits,
+    ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
+        self.capture_build_capacity_assessment(projects, profiles, tracked_profiles, Some(limits))
             .await
     }
 
@@ -300,17 +314,34 @@ impl Scheduler {
         &self,
         projects: std::collections::HashSet<ProjectId>,
         profiles: Vec<capacity::BuildCapacityProfile>,
+        tracked_profiles: Vec<capacity::BuildCapacityProfile>,
         limits: Option<capacity::BuildCapacityLimits>,
     ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
         capacity::BuildCapacityProfile::validate_all(&profiles)?;
+        capacity::BuildCapacityProfile::validate_all(&tracked_profiles)?;
         let snapshot = self
-            .capture_build_capacity(projects.clone(), limits)
+            .capture_build_capacity(
+                projects.clone(),
+                tracked_profiles
+                    .iter()
+                    .map(|profile| profile.worker_id.clone())
+                    .collect(),
+                limits,
+            )
             .await?;
         let profiles = profiles
             .into_iter()
             .map(|profile| profile.prospective_worker(&projects, &self.job_policy))
             .collect();
-        Ok(capacity::BuildCapacityAssessment { snapshot, profiles })
+        let tracked_profiles = tracked_profiles
+            .into_iter()
+            .map(|profile| profile.prospective_worker(&projects, &self.job_policy))
+            .collect();
+        Ok(capacity::BuildCapacityAssessment {
+            snapshot,
+            profiles,
+            tracked_profiles,
+        })
     }
 
     pub async fn board_active_jobs(&self) -> Vec<jobs::BoardActiveJob> {

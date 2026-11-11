@@ -117,6 +117,7 @@ pub struct ProspectiveBuildWorker {
 pub struct BuildCapacityAssessment {
     pub snapshot: BuildCapacitySnapshot,
     pub profiles: Vec<ProspectiveBuildWorker>,
+    pub tracked_profiles: Vec<ProspectiveBuildWorker>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
@@ -127,6 +128,17 @@ pub struct BuildProfileAssessment {
 }
 
 impl BuildCapacityAssessment {
+    pub fn assess_tracked_profile(
+        &self,
+        build: &ReadyBuild,
+        profile: &ProspectiveBuildWorker,
+    ) -> Option<BuildProfileAssessment> {
+        if self.snapshot.connected_workers.contains(&profile.worker.id) {
+            return None;
+        }
+        self.assess_profile(build, profile)
+    }
+
     pub fn assess_profile(
         &self,
         build: &ReadyBuild,
@@ -173,6 +185,8 @@ pub struct BuildCapacitySnapshot {
     pub builds: Vec<ReadyBuild>,
     pub total_ready_builds: usize,
     pub workers: Vec<BuildCapacityWorker>,
+    /// Requested identities connected to this instance, independently of project eligibility.
+    pub connected_workers: HashSet<String>,
     pub instance: InstanceContext,
 }
 
@@ -201,6 +215,16 @@ pub struct BuildResourceAssessment {
 }
 
 impl BuildCapacitySnapshot {
+    pub fn waiting_build(&self, worker: &BuildCapacityWorker) -> Option<(usize, u64)> {
+        let waiting = worker.waiting_build?;
+        let index = self.builds.iter().position(|build| build.id == waiting)?;
+        let mut metrics = worker.caps.metrics?;
+        let available = metrics.ram_available_mb()?;
+        metrics.ram_reserved_for_waiting_build_mb = 0;
+        let credit = metrics.ram_available_mb()?.saturating_sub(available);
+        (credit > 0).then_some((index, credit))
+    }
+
     /// Evaluate captured resources without claiming a job or changing its worker.
     /// Worker-local store scores are not included.
     pub fn assess(
@@ -290,6 +314,7 @@ mod tests {
             captured_at: gradient_types::now(),
             server_draining: false,
             total_ready_builds: 1,
+            connected_workers: HashSet::new(),
             builds: vec![ReadyBuild {
                 id: DerivationBuildId::now_v7(),
                 project,
@@ -359,6 +384,7 @@ mod tests {
         let policy: Arc<dyn WorkerJobPolicy> = Arc::new(gradient_pool::EveryJobAllowed);
         BuildCapacityAssessment {
             snapshot,
+            tracked_profiles: vec![],
             profiles: profiles
                 .into_iter()
                 .map(|profile| profile.prospective_worker(&projects, &policy))
@@ -422,6 +448,52 @@ mod tests {
         assert_eq!(result.resources.reserved_ram_mb, Some(2_000));
         assert_eq!(result.resources.ram_fit, Some(RamFit::Fits));
         assert_eq!(result.prediction_fit, None);
+    }
+
+    #[test]
+    fn tracked_capacity_is_never_counted_as_starting_after_connection() {
+        let mut assessment = prospective(
+            snapshot(BuildEstimate::fixed(Some(1_000), None, 1), worker()),
+            vec![profile("starting", 4_000)],
+        );
+        assessment.tracked_profiles = std::mem::take(&mut assessment.profiles);
+        let tracked = &assessment.tracked_profiles[0];
+        let build = &assessment.snapshot.builds[0];
+        assert!(assessment.assess_tracked_profile(build, tracked).is_some());
+        assessment
+            .snapshot
+            .connected_workers
+            .insert(tracked.worker.id.clone());
+        assert!(assessment.assess_tracked_profile(build, tracked).is_none());
+        assessment.snapshot.workers.clear();
+        assert!(assessment.assess_tracked_profile(build, tracked).is_none());
+    }
+
+    #[test]
+    fn waiting_capacity_credit_is_capped_by_the_native_unreserved_budget() {
+        let mut snapshot = snapshot(
+            BuildEstimate::default(),
+            WorkerMetricsView {
+                ram_total_mb: 10_000,
+                ram_free_mb: Some(1_000),
+                ram_reserved_for_waiting_build_mb: 2_000,
+                ..worker()
+            },
+        );
+        snapshot.workers[0].waiting_build = Some(snapshot.builds[0].id);
+        assert_eq!(
+            snapshot.waiting_build(&snapshot.workers[0]),
+            Some((0, 1_000))
+        );
+        snapshot.workers[0]
+            .caps
+            .metrics
+            .as_mut()
+            .unwrap()
+            .ram_reserved_for_waiting_build_mb = 500;
+        assert_eq!(snapshot.waiting_build(&snapshot.workers[0]), Some((0, 500)));
+        snapshot.builds.clear();
+        assert_eq!(snapshot.waiting_build(&snapshot.workers[0]), None);
     }
 
     #[test]

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use gradient_db::scheduling::assignment_record::ClaimGate;
@@ -1951,27 +1951,52 @@ impl JobTracker {
     pub(crate) fn ready_builds(
         &self,
         projects: &HashSet<ProjectId>,
-    ) -> Vec<crate::capacity::ReadyBuild> {
-        self.pending
-            .values()
-            .filter_map(|job| match job {
+        limit: usize,
+        scan_limit: usize,
+    ) -> anyhow::Result<(usize, Vec<crate::capacity::ReadyBuild>)> {
+        anyhow::ensure!(
+            self.pending.capacity() <= scan_limit,
+            "too many pending jobs to scan for a capacity assessment"
+        );
+        let mut oldest = BTreeMap::new();
+        let mut total = 0;
+        for job in self.pending.values() {
+            match job {
                 PendingJob::Build(build)
                     if build.job.build.kind == BuildSpecKind::Build
                         && projects.contains(&build.project_id) =>
                 {
-                    Some(crate::capacity::ReadyBuild {
-                        id: build.derivation_build,
-                        project: build.project_id,
-                        requirement: build.job.requirement.clone(),
-                        is_fixed_output: build.job.build.is_fixed_output,
-                        prefer_local_build: build.prefer_local_build,
-                        ready_at: build.ready_at,
-                        estimate: build.estimate.clone(),
-                    })
+                    total += 1;
+                    let key = (build.ready_at, build.derivation_build);
+                    if limit == 0
+                        || (oldest.len() == limit
+                            && oldest
+                                .last_key_value()
+                                .is_some_and(|(last, _)| key >= *last))
+                    {
+                        continue;
+                    }
+                    oldest.insert(key, build);
+                    if oldest.len() > limit {
+                        oldest.pop_last();
+                    }
                 }
-                _ => None,
+                _ => {}
+            }
+        }
+        let builds = oldest
+            .into_values()
+            .map(|build| crate::capacity::ReadyBuild {
+                id: build.derivation_build,
+                project: build.project_id,
+                requirement: build.job.requirement.clone(),
+                is_fixed_output: build.job.build.is_fixed_output,
+                prefer_local_build: build.prefer_local_build,
+                ready_at: build.ready_at,
+                estimate: build.estimate.clone(),
             })
-            .collect()
+            .collect();
+        Ok((total, builds))
     }
 
     pub fn pending_snapshot(&self) -> Vec<PendingJobInfo> {
@@ -2359,6 +2384,42 @@ mod tests {
             eval_index: 0,
             continuation: None,
         })
+    }
+
+    #[test]
+    fn capacity_batches_keep_the_oldest_scoped_builds_and_the_full_count() {
+        let project = ProjectId::now_v7();
+        let scope = HashSet::from([project]);
+        let mut tracker = JobTracker::new();
+        let now = gradient_types::now();
+        let mut expected = Vec::new();
+        for age in [1, 3, 2] {
+            let mut job = build_job(project, vec![]);
+            let PendingJob::Build(build) = &mut job else {
+                unreachable!()
+            };
+            build.ready_at = now - chrono::Duration::seconds(age);
+            expected.push((build.ready_at, build.derivation_build));
+            tracker.add_pending(format!("build:{age}"), job);
+        }
+        tracker.add_pending("eval".into(), eval_job(project));
+        tracker.add_pending("outside".into(), build_job(ProjectId::now_v7(), vec![]));
+        expected.sort();
+
+        let (total, batch) = tracker.ready_builds(&scope, 2, usize::MAX).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            batch
+                .iter()
+                .map(|build| (build.ready_at, build.id))
+                .collect::<Vec<_>>(),
+            expected[..2],
+        );
+        assert_eq!(tracker.pending_count(), 5);
+        let (total, empty) = tracker.ready_builds(&scope, 0, usize::MAX).unwrap();
+        assert_eq!(total, 3);
+        assert!(empty.is_empty());
+        assert!(tracker.ready_builds(&scope, 2, 0).is_err());
     }
 
     fn fetch_eval_job(peer: ProjectId) -> PendingJob {

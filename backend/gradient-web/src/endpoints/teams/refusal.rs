@@ -22,6 +22,12 @@ pub(crate) enum TeamRefusal {
     MemberManagedByState,
     #[error("the worker id is already registered")]
     WorkerIdRegistered,
+    #[error("capacity assessment accepts at most 16 profiles and 256 project IDs")]
+    CapacityRequestTooLarge,
+    #[error("invalid build capacity profile: {0}")]
+    InvalidCapacityProfile(String),
+    #[error("capacity assessment requires a worker grant for every requested project")]
+    CapacityProjectNotGranted,
 }
 
 impl Refusal for TeamRefusal {
@@ -30,8 +36,12 @@ impl Refusal for TeamRefusal {
             Self::EmptyGrant
             | Self::EmptyGrantAfterUpdate
             | Self::RoleRequiredForUsers
-            | Self::InvalidNewProjectRole => RefusalStatus::BadRequest,
-            Self::WorkersNeedTeamAdmin => RefusalStatus::Forbidden,
+            | Self::InvalidNewProjectRole
+            | Self::CapacityRequestTooLarge
+            | Self::InvalidCapacityProfile(_) => RefusalStatus::BadRequest,
+            Self::WorkersNeedTeamAdmin | Self::CapacityProjectNotGranted => {
+                RefusalStatus::Forbidden
+            }
             Self::MemberManagedByState | Self::WorkerIdRegistered => RefusalStatus::Conflict,
         }
     }

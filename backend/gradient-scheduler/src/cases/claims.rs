@@ -2286,6 +2286,23 @@ async fn c33_capacity_assessment_respects_project_scope_and_the_worker_job_polic
             .assess(&denied.builds[0], &denied.workers[0])
             .is_none()
     );
+    let bounded = case
+        .scheduler
+        .assess_build_capacity_with_limits(
+            HashSet::from([p1]),
+            vec![],
+            crate::capacity::BuildCapacityLimits {
+                builds: 1,
+                workers: 0,
+                scanned_jobs: usize::MAX,
+                scanned_workers: usize::MAX,
+                assigned_jobs_per_worker: usize::MAX,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(bounded.snapshot.total_ready_builds, 1);
+    assert!(bounded.snapshot.workers.is_empty());
 
     let allowed = case
         .scheduler

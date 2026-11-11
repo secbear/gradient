@@ -312,6 +312,13 @@ export interface BuildAttemptLogRow {
   created_at: string;
 }
 
+export interface BuildCapacityProfile {
+  name: string;
+  worker_id: string;
+  capabilities: GradientCapabilities;
+  resources: WorkerProfile;
+}
+
 export interface BuildGraph {
   root: DerivationId;
   nodes: DependencyGraphNode[];
@@ -345,6 +352,11 @@ export interface BuildProduct {
 
 export type BuildProductId = string;
 
+export interface BuildProfileAssessment {
+  resources: BuildResourceAssessment;
+  prediction_fit?: RamFit | null;
+}
+
 export interface BuildProgress {
   phase: BuildProgressPhase;
   bytes_done: number;
@@ -354,6 +366,17 @@ export interface BuildProgress {
 }
 
 export type BuildProgressPhase = "download" | "prefetch" | "upload";
+
+export interface BuildResourceAssessment {
+  cores: number;
+  reserved_ram_mb?: number | null;
+  predicted_ram_mb?: number | null;
+  ram_fit?: RamFit | null;
+  memory_assumption: MemoryAssumption;
+  own_samples: number;
+  build_time_known: boolean;
+  time: TimeEstimate;
+}
 
 export type BuildStatus = "Created" | "Queued" | "Building" | "Completed" | "FailedPermanent" | "Aborted" | "DependencyFailed" | "Substituted" | "FailedTransient" | "FailedTimeout" | "Skipped";
 
@@ -478,6 +501,41 @@ export interface CacheTotals {
 }
 
 export type CacheUpstreamId = string;
+
+export interface CapacityAssessmentRequest {
+  projects?: ProjectId[] | null;
+  profiles: CapacityProfileRequest[];
+}
+
+export interface CapacityAssessmentResponse {
+  captured_at: string;
+  server_draining: boolean;
+  total_ready_builds: number;
+  builds_truncated: boolean;
+  workers: CapacityWorker[];
+  profiles: BuildCapacityProfile[];
+  builds: CapacityBuild[];
+}
+
+export interface CapacityBuild {
+  architecture: string;
+  required_features: string[];
+  is_fixed_output: boolean;
+  ready_at: string;
+  workers: (BuildResourceAssessment | null)[];
+  profiles: (BuildProfileAssessment | null)[];
+}
+
+export interface CapacityProfileRequest {
+  profile: BuildCapacityProfile;
+  enable_network: boolean;
+  enable_build: boolean;
+}
+
+export interface CapacityWorker {
+  free_slots: number;
+  available_ram_mb?: number | null;
+}
 
 export interface CatalogEntry {
   name: string;
@@ -1069,6 +1127,39 @@ export interface EvaluationTriggerSummary {
   type: TriggerType;
 }
 
+export interface ExecAllow {
+  network: boolean;
+  ssh: boolean;
+  ports: PortRanges;
+  nodes: number;
+  devices: string[];
+  mounts: string[];
+  custom_images: boolean;
+  timeout_secs?: number | null;
+  max_silent_secs?: number | null;
+  retries: number;
+}
+
+export interface ExecDefaults {
+  network: boolean;
+  ssh: boolean;
+  mounts: string[];
+  max_silent_secs?: number | null;
+}
+
+export interface ExecInventory {
+  labels: string[];
+  devices: DeviceClass[];
+  mounts: string[];
+  secrets: string[];
+  allow: ExecAllow;
+  defaults: ExecDefaults;
+  warm_guests: number;
+  guest_capacity?: GuestCapacity;
+  warm_guest_size?: GuestSize;
+  warm_guest_sizes?: WarmGuests[];
+}
+
 export interface ExecJobAttemptView {
   number: number;
   worker: string;
@@ -1275,6 +1366,8 @@ export interface FailedBuildSummary {
   newly_failing: boolean;
 }
 
+export type Fallback = "missing_nar_size" | "missing_count" | "build_history" | "core_score" | "download_speed" | "upload_speed" | "storage_read_speed" | "storage_write_speed" | "compression_ratio" | "per_path_secs" | "output_nar_size" | "substitute_cost";
+
 export type FileTree = {
   executable?: boolean;
   size: number;
@@ -1388,6 +1481,12 @@ export interface GroupResource {
   displayName: string;
   members: GroupMember[];
   meta: Meta;
+}
+
+export interface GuestCapacity {
+  cpus: ResourceAmount;
+  memory_mb: ResourceAmount;
+  disk_mb: ResourceAmount;
 }
 
 export interface GuestSize {
@@ -1734,6 +1833,8 @@ export interface MemberItem {
   user_display_name?: string | null;
   name: string;
 }
+
+export type MemoryAssumption = "predicted" | "unmeasured" | "negligible" | "proportional";
 
 export type MessageLevel = "Error" | "Warning" | "Notice";
 
@@ -2085,6 +2186,13 @@ export interface PermissionEntry {
   mutating: boolean;
 }
 
+export interface PortRange {
+  first: number;
+  last: number;
+}
+
+export type PortRanges = PortRange[];
+
 export type PrGranularity = "per_run" | "per_input";
 
 export interface ProcessStat {
@@ -2255,6 +2363,8 @@ export interface RailTask {
   status?: EvaluationStatus | null;
 }
 
+export type RamFit = "fits" | "fits_once_ram_is_released" | "does_not_fit";
+
 export interface RegisterWorkerRequest {
   worker_id: string;
   url?: string | null;
@@ -2311,6 +2421,11 @@ export interface RepositoryIntegration {
 }
 
 export type RequestKind = "project" | "cache";
+
+export interface ResourceAmount {
+  total: number;
+  free: number;
+}
 
 export interface RevokeInvitationRequest {
   user: string;
@@ -2772,6 +2887,19 @@ export type TeamWorkerEntry = WorkerConnection & {
 
 export type Tier = "starred_active" | "active" | "starred" | "team" | "member";
 
+export interface TimeEstimate {
+  download_secs: number;
+  path_secs: number;
+  build_secs: number;
+  upload_secs: number;
+  eval_secs: number;
+  nar_bytes: number;
+  paths: number;
+  output_nar_bytes: number;
+  cores?: number | null;
+  fallbacks: Fallback[];
+}
+
 export interface TopProjectBuildTime {
   project: string;
   project_name: string;
@@ -2989,6 +3117,11 @@ export type WaitingReason = {
 
 export type WalkMode = "pruned" | "full";
 
+export interface WarmGuests {
+  size: GuestSize;
+  count: number;
+}
+
 export type WebhookDeliveryId = string;
 
 export type WebhookId = string;
@@ -3073,6 +3206,19 @@ export interface WorkerNet {
   upload_speed_mbps?: number | null;
   download_speed_mbps?: number | null;
   disk_speed_mbps?: number | null;
+}
+
+export interface WorkerProfile {
+  architectures: string[];
+  system_features: string[];
+  max_concurrent_builds: number;
+  cpu_count: number;
+  ram_total_mb: number;
+  cpu_core_score: number;
+  zone?: string | null;
+  endpoint?: string | null;
+  build_cores?: number | null;
+  exec?: ExecInventory | null;
 }
 
 export interface WorkerSamplePoint {

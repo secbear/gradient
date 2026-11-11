@@ -25,7 +25,8 @@ pub struct CoreChoice {
     pub fit: RamFit,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryAssumption {
     Predicted,
     Unmeasured,

@@ -121,7 +121,8 @@ impl RamNeed {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum RamFit {
     Fits,
     FitsOnceRamIsReleased,

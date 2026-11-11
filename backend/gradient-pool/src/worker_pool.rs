@@ -490,10 +490,21 @@ impl WorkerPool {
     }
 
     pub fn all_workers(&self) -> Vec<WorkerInfo> {
+        self.worker_infos().collect()
+    }
+
+    pub fn worker_infos(&self) -> impl Iterator<Item = WorkerInfo> + '_ {
         self.workers
             .iter()
             .map(|(id, slot)| self.info_for(id, slot))
-            .collect()
+    }
+
+    pub fn capacity_scan_fits(&self, workers: usize, assigned_jobs: usize) -> bool {
+        self.workers.capacity() <= workers
+            && self
+                .workers
+                .values()
+                .all(|slot| slot.shared().assigned_jobs.capacity() <= assigned_jobs)
     }
 
     pub fn stale_worker_ids(&self, now_ms: i64, timeout_ms: i64) -> Vec<String> {

@@ -369,6 +369,9 @@ pub fn create_router_with_scheduler(
                 )?)),
         )
         .layer(axum::Extension(Arc::clone(&scheduler)))
+        .layer(axum::Extension(
+            endpoints::teams::capacity::CapacityAssessmentAdmission::default(),
+        ))
         .layer(axum::Extension(Arc::clone(&proto_limiter)))
         .layer(axum::Extension(Arc::clone(&sessions)));
 

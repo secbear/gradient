@@ -374,7 +374,8 @@ pub enum SchedulerMsg {
         projects: HashSet<ProjectId>,
         instance: InstanceContext,
         draining: crate::draining::Draining,
-        reply: RpcReplyPort<crate::capacity::BuildCapacitySnapshot>,
+        limits: Option<crate::capacity::BuildCapacityLimits>,
+        reply: RpcReplyPort<anyhow::Result<crate::capacity::BuildCapacitySnapshot>>,
     },
     BoardActiveJobs {
         reply: RpcReplyPort<Vec<BoardActiveJob>>,
@@ -582,11 +583,32 @@ impl SchedulerCore {
         projects: &HashSet<ProjectId>,
         instance: &InstanceContext,
         server_draining: bool,
-    ) -> crate::capacity::BuildCapacitySnapshot {
+        limits: Option<crate::capacity::BuildCapacityLimits>,
+    ) -> anyhow::Result<crate::capacity::BuildCapacitySnapshot> {
+        if limits.is_some() && projects.is_empty() {
+            return Ok(crate::capacity::BuildCapacitySnapshot {
+                captured_at: gradient_types::now(),
+                server_draining,
+                builds: vec![],
+                total_ready_builds: 0,
+                workers: vec![],
+                instance: *instance,
+            });
+        }
+        anyhow::ensure!(
+            limits.is_none_or(|limits| self
+                .pool
+                .capacity_scan_fits(limits.scanned_workers, limits.assigned_jobs_per_worker,)),
+            "too much fleet state to scan for a capacity assessment"
+        );
+        let (total_ready_builds, builds) = self.tracker.ready_builds(
+            projects,
+            limits.map_or(usize::MAX, |limits| limits.builds),
+            limits.map_or(usize::MAX, |limits| limits.scanned_jobs),
+        )?;
         let workers = self
             .pool
-            .all_workers()
-            .into_iter()
+            .worker_infos()
             .filter_map(|worker| {
                 let authorized = self
                     .pool
@@ -601,7 +623,10 @@ impl SchedulerCore {
                     return None;
                 }
                 let mut caps = self.pool.worker_caps(&worker.id)?;
-                if !caps.capabilities.build {
+                if !caps.capabilities.build
+                    || (limits.is_some()
+                        && !caps.allowed_jobs.contains(gradient_pool::WorkerJob::Build))
+                {
                     return None;
                 }
                 let waiting = self.tracker.waiting_build(&worker.id);
@@ -629,14 +654,20 @@ impl SchedulerCore {
                     waiting_build,
                 })
             })
-            .collect();
-        crate::capacity::BuildCapacitySnapshot {
+            .take(limits.map_or(usize::MAX, |limits| limits.workers.saturating_add(1)))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            limits.is_none_or(|limits| workers.len() <= limits.workers),
+            "too many workers for a capacity assessment"
+        );
+        Ok(crate::capacity::BuildCapacitySnapshot {
             captured_at: gradient_types::now(),
             server_draining,
-            builds: self.tracker.ready_builds(projects),
+            builds,
+            total_ready_builds,
             workers,
             instance: self.with_live_transfers(instance),
-        }
+        })
     }
 
     fn candidates(&mut self, worker: &str, only_new: bool) -> Offer {
@@ -1464,11 +1495,22 @@ impl Actor for CoreActor {
                 projects,
                 instance,
                 draining,
+                limits,
                 reply,
             } => {
+                if reply.is_closed() {
+                    return Ok(());
+                }
                 let server_draining = draining.is_draining().await;
-                let _ =
-                    reply.send(core.build_capacity_snapshot(&projects, &instance, server_draining));
+                if reply.is_closed() {
+                    return Ok(());
+                }
+                let _ = reply.send(core.build_capacity_snapshot(
+                    &projects,
+                    &instance,
+                    server_draining,
+                    limits,
+                ));
             }
             SchedulerMsg::BoardActiveJobs { reply } => {
                 let _ = reply.send(core.tracker.board_active_jobs());
@@ -1593,13 +1635,95 @@ mod tests {
                 kinds: vec![kind],
                 since: std::time::Instant::now(),
             });
-            let snapshot =
-                core.build_capacity_snapshot(&projects, &InstanceContext::default(), false);
+            let snapshot = core
+                .build_capacity_snapshot(&projects, &InstanceContext::default(), false, None)
+                .unwrap();
             assert_eq!(snapshot.builds.len(), 1);
             assert_eq!(snapshot.workers[0].free_slots, expected);
             assert!(core.reservation.is_some());
             assert_eq!(core.tracker.pending_count(), 1);
         }
+    }
+
+    #[test]
+    fn capacity_limits_never_sample_live_supply_or_report_scan_failure_as_empty() {
+        use crate::capacity::BuildCapacityLimits;
+
+        let mut core = core_with_a_128_gb_worker();
+        let key = pending_heavy_build(&mut core, 1_000);
+        let projects = HashSet::from([core.tracker.pending_job(&key).unwrap().project_id()]);
+        let capture = |limits| {
+            core.build_capacity_snapshot(
+                &projects,
+                &InstanceContext::default(),
+                false,
+                Some(limits),
+            )
+        };
+        let limits = BuildCapacityLimits {
+            builds: 1,
+            workers: 1,
+            scanned_jobs: usize::MAX,
+            scanned_workers: usize::MAX,
+            assigned_jobs_per_worker: usize::MAX,
+        };
+        assert!(
+            capture(BuildCapacityLimits {
+                workers: 0,
+                ..limits
+            })
+            .is_err()
+        );
+        assert!(
+            capture(BuildCapacityLimits {
+                scanned_jobs: 0,
+                ..limits
+            })
+            .is_err()
+        );
+        assert!(
+            capture(BuildCapacityLimits {
+                scanned_workers: 0,
+                ..limits
+            })
+            .is_err()
+        );
+        let snapshot = capture(BuildCapacityLimits {
+            builds: 0,
+            ..limits
+        })
+        .unwrap();
+        assert_eq!(snapshot.total_ready_builds, 1);
+        assert!(snapshot.builds.is_empty());
+        assert_eq!(snapshot.workers.len(), 1);
+        assert_eq!(core.tracker.pending_count(), 1);
+        assert_eq!(core.pool.worker_count(), 1);
+    }
+
+    #[test]
+    fn capacity_scan_limits_cover_assignment_storage_even_after_jobs_are_released() {
+        let mut core = core_with_a_128_gb_worker();
+        let key = pending_heavy_build(&mut core, 1_000);
+        let projects = HashSet::from([core.tracker.pending_job(&key).unwrap().project_id()]);
+        let assigned = assigned_build(&mut core, "w1").unwrap();
+        core.pool.release_job("w1", &assigned);
+        let limited = core.build_capacity_snapshot(
+            &projects,
+            &InstanceContext::default(),
+            false,
+            Some(crate::capacity::BuildCapacityLimits {
+                builds: 1,
+                workers: 1,
+                scanned_jobs: usize::MAX,
+                scanned_workers: usize::MAX,
+                assigned_jobs_per_worker: 0,
+            }),
+        );
+        assert!(limited.is_err());
+        assert!(
+            core.build_capacity_snapshot(&projects, &InstanceContext::default(), false, None)
+                .is_ok()
+        );
     }
 
     #[test]

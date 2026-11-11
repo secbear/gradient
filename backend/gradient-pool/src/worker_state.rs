@@ -54,7 +54,10 @@ fn lower_by_held(capacity: &mut GuestCapacity, held: &GuestSize) {
     capacity.disk_mb.free = effective_free_amount(&capacity.disk_mb, held.disk_mb);
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerProfile {
     pub architectures: Vec<String>,
     pub system_features: Vec<String>,

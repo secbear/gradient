@@ -255,14 +255,23 @@ impl Scheduler {
         &self,
         projects: std::collections::HashSet<ProjectId>,
     ) -> anyhow::Result<capacity::BuildCapacitySnapshot> {
+        self.capture_build_capacity(projects, None).await
+    }
+
+    async fn capture_build_capacity(
+        &self,
+        projects: std::collections::HashSet<ProjectId>,
+        limits: Option<capacity::BuildCapacityLimits>,
+    ) -> anyhow::Result<capacity::BuildCapacitySnapshot> {
         let instance = **self.scoring.instance.load();
         self.call(|reply| SchedulerMsg::BuildCapacitySnapshot {
             projects,
             instance,
             draining: self.draining.clone(),
+            limits,
             reply,
         })
-        .await
+        .await?
     }
 
     /// Assess prospective builder profiles without registering workers or reserving capacity.
@@ -272,8 +281,31 @@ impl Scheduler {
         projects: std::collections::HashSet<ProjectId>,
         profiles: Vec<capacity::BuildCapacityProfile>,
     ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
+        self.capture_build_capacity_assessment(projects, profiles, None)
+            .await
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn assess_build_capacity_with_limits(
+        &self,
+        projects: std::collections::HashSet<ProjectId>,
+        profiles: Vec<capacity::BuildCapacityProfile>,
+        limits: capacity::BuildCapacityLimits,
+    ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
+        self.capture_build_capacity_assessment(projects, profiles, Some(limits))
+            .await
+    }
+
+    async fn capture_build_capacity_assessment(
+        &self,
+        projects: std::collections::HashSet<ProjectId>,
+        profiles: Vec<capacity::BuildCapacityProfile>,
+        limits: Option<capacity::BuildCapacityLimits>,
+    ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
         capacity::BuildCapacityProfile::validate_all(&profiles)?;
-        let snapshot = self.build_capacity_snapshot(projects.clone()).await?;
+        let snapshot = self
+            .capture_build_capacity(projects.clone(), limits)
+            .await?;
         let profiles = profiles
             .into_iter()
             .map(|profile| profile.prospective_worker(&projects, &self.job_policy))

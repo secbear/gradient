@@ -12230,6 +12230,44 @@ paths:
           $ref: '#/components/responses/Error'
       security:
       - bearerAuth: []
+  /api/v1/teams/{team}/workers/capacity-assessment:
+    post:
+      tags:
+      - teams
+      summary: Assess local ordinary-build capacity
+      description: Needs Admin in the team. Assesses only projects granting the team its workers. This is one scheduler instance's resource snapshot, not placement or a reservation. Workers and builds have response-local indexes, not stable identities. The oldest 128 ready builds are returned with the total backlog and an explicit truncation flag; workers are never sampled. Accepts at most 16 profiles, 256 project IDs and 64 KiB. Returns 503 when capture, scan or worker limits prevent assessment. Profiles must use unregistered UUIDs; their advertised build/network capabilities are intersected with the intended registration's enable flags. Profile results are conditional on registering that exact ID under this team and satisfying worker token and project cache requirements. Profiles are alternatives, not live or starting supply. Fit does not imply a free build slot; unknown predictions and fallback reservations remain distinct. captured_at is not a metrics sample timestamp.
+      operationId: assessTeamBuildCapacity
+      parameters:
+      - name: team
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapacityAssessmentRequest'
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                - message
+                properties:
+                  error:
+                    type: boolean
+                  message:
+                    $ref: '#/components/schemas/CapacityAssessmentResponse'
+        default:
+          $ref: '#/components/responses/Error'
+      security:
+      - bearerAuth: []
   /api/v1/teams/{team}/workers/demand:
     get:
       tags:
@@ -15208,6 +15246,24 @@ components:
         created_at:
           type: string
           format: date-time
+    BuildCapacityProfile:
+      type: object
+      description: A prospective builder's resources; RAM is the usable build budget, not host memory.
+      required:
+      - name
+      - worker_id
+      - capabilities
+      - resources
+      properties:
+        name:
+          type: string
+        worker_id:
+          type: string
+        capabilities:
+          $ref: '#/components/schemas/GradientCapabilities'
+        resources:
+          $ref: '#/components/schemas/WorkerProfile'
+      additionalProperties: false
     BuildGraph:
       type: object
       required:
@@ -15302,6 +15358,18 @@ components:
     BuildProductId:
       type: string
       format: uuid
+    BuildProfileAssessment:
+      type: object
+      required:
+      - resources
+      properties:
+        resources:
+          $ref: '#/components/schemas/BuildResourceAssessment'
+        prediction_fit:
+          oneOf:
+          - $ref: '#/components/schemas/RamFit'
+            description: Fit of the model prediction, independently of the scheduler's reservation fallback.
+          - type: 'null'
     BuildProgress:
       type: object
       required:
@@ -15337,6 +15405,48 @@ components:
       - download
       - prefetch
       - upload
+    BuildResourceAssessment:
+      type: object
+      required:
+      - cores
+      - memory_assumption
+      - own_samples
+      - build_time_known
+      - time
+      properties:
+        cores:
+          type: integer
+          format: int32
+          minimum: 0
+        reserved_ram_mb:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The policy reservation, not a measured peak; absent when no memory estimate exists.
+          minimum: 0
+        predicted_ram_mb:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The original prediction at the chosen cores, before any proportional fallback.
+          minimum: 0
+        ram_fit:
+          oneOf:
+          - $ref: '#/components/schemas/RamFit'
+          - type: 'null'
+        memory_assumption:
+          $ref: '#/components/schemas/MemoryAssumption'
+        own_samples:
+          type: integer
+          format: int32
+          minimum: 0
+        build_time_known:
+          type: boolean
+          description: False when the native time estimator has neither model history nor a fleet median.
+        time:
+          $ref: '#/components/schemas/TimeEstimate'
     BuildStatus:
       type: string
       enum:
@@ -15722,6 +15832,123 @@ components:
     CacheUpstreamId:
       type: string
       format: uuid
+    CapacityAssessmentRequest:
+      type: object
+      required:
+      - profiles
+      properties:
+        projects:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/ProjectId'
+          description: Omit to assess all projects granting the team its workers; an empty list assesses none.
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapacityProfileRequest'
+      additionalProperties: false
+    CapacityAssessmentResponse:
+      type: object
+      required:
+      - captured_at
+      - server_draining
+      - total_ready_builds
+      - builds_truncated
+      - workers
+      - profiles
+      - builds
+      properties:
+        captured_at:
+          type: string
+          format: date-time
+          description: Capture time, not the age of the underlying worker metrics or model samples.
+        server_draining:
+          type: boolean
+        total_ready_builds:
+          type: integer
+          minimum: 0
+        builds_truncated:
+          type: boolean
+        workers:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapacityWorker'
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/BuildCapacityProfile'
+        builds:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapacityBuild'
+    CapacityBuild:
+      type: object
+      required:
+      - architecture
+      - required_features
+      - is_fixed_output
+      - ready_at
+      - workers
+      - profiles
+      properties:
+        architecture:
+          type: string
+        required_features:
+          type: array
+          items:
+            type: string
+        is_fixed_output:
+          type: boolean
+        ready_at:
+          type: string
+          format: date-time
+        workers:
+          type: array
+          items:
+            oneOf:
+            - $ref: '#/components/schemas/BuildResourceAssessment'
+            - type: 'null'
+          description: Entries correspond to the response's workers; null means no eligible resource assessment.
+        profiles:
+          type: array
+          items:
+            oneOf:
+            - $ref: '#/components/schemas/BuildProfileAssessment'
+            - type: 'null'
+          description: Entries correspond to the response's profiles, which are conditional sizing alternatives.
+    CapacityProfileRequest:
+      type: object
+      required:
+      - profile
+      - enable_network
+      - enable_build
+      properties:
+        profile:
+          $ref: '#/components/schemas/BuildCapacityProfile'
+        enable_network:
+          type: boolean
+          description: Whether the intended registration will permit network access.
+        enable_build:
+          type: boolean
+          description: Whether the intended registration will permit builds.
+      additionalProperties: false
+    CapacityWorker:
+      type: object
+      required:
+      - free_slots
+      properties:
+        free_slots:
+          type: integer
+          format: int32
+          minimum: 0
+        available_ram_mb:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
     CatalogEntry:
       type: object
       required:
@@ -17422,6 +17649,118 @@ components:
           $ref: '#/components/schemas/TaskTriggerId'
         type:
           $ref: '#/components/schemas/TriggerType'
+    ExecAllow:
+      type: object
+      required:
+      - network
+      - ssh
+      - ports
+      - nodes
+      - devices
+      - mounts
+      - custom_images
+      - retries
+      properties:
+        network:
+          type: boolean
+        ssh:
+          type: boolean
+        ports:
+          $ref: '#/components/schemas/PortRanges'
+        nodes:
+          type: integer
+          format: int32
+          minimum: 0
+        devices:
+          type: array
+          items:
+            type: string
+        mounts:
+          type: array
+          items:
+            type: string
+        custom_images:
+          type: boolean
+        timeout_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+        max_silent_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+        retries:
+          type: integer
+          format: int32
+          minimum: 0
+    ExecDefaults:
+      type: object
+      required:
+      - network
+      - ssh
+      - mounts
+      properties:
+        network:
+          type: boolean
+        ssh:
+          type: boolean
+        mounts:
+          type: array
+          items:
+            type: string
+        max_silent_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+    ExecInventory:
+      type: object
+      required:
+      - labels
+      - devices
+      - mounts
+      - secrets
+      - allow
+      - defaults
+      - warm_guests
+      properties:
+        labels:
+          type: array
+          items:
+            type: string
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceClass'
+        mounts:
+          type: array
+          items:
+            type: string
+        secrets:
+          type: array
+          items:
+            type: string
+        allow:
+          $ref: '#/components/schemas/ExecAllow'
+        defaults:
+          $ref: '#/components/schemas/ExecDefaults'
+        warm_guests:
+          type: integer
+          format: int32
+          minimum: 0
+        guest_capacity:
+          $ref: '#/components/schemas/GuestCapacity'
+        warm_guest_size:
+          $ref: '#/components/schemas/GuestSize'
+        warm_guest_sizes:
+          type: array
+          items:
+            $ref: '#/components/schemas/WarmGuests'
     ExecJobAttemptView:
       type: object
       required:
@@ -18089,6 +18428,21 @@ components:
           minimum: 0
         newly_failing:
           type: boolean
+    Fallback:
+      type: string
+      enum:
+      - missing_nar_size
+      - missing_count
+      - build_history
+      - core_score
+      - download_speed
+      - upload_speed
+      - storage_read_speed
+      - storage_write_speed
+      - compression_ratio
+      - per_path_secs
+      - output_nar_size
+      - substitute_cost
     FileTree:
       oneOf:
       - type: object
@@ -18399,6 +18753,19 @@ components:
             $ref: '#/components/schemas/GroupMember'
         meta:
           $ref: '#/components/schemas/Meta'
+    GuestCapacity:
+      type: object
+      required:
+      - cpus
+      - memory_mb
+      - disk_mb
+      properties:
+        cpus:
+          $ref: '#/components/schemas/ResourceAmount'
+        memory_mb:
+          $ref: '#/components/schemas/ResourceAmount'
+        disk_mb:
+          $ref: '#/components/schemas/ResourceAmount'
     GuestSize:
       type: object
       required:
@@ -19375,6 +19742,13 @@ components:
           - 'null'
         name:
           type: string
+    MemoryAssumption:
+      type: string
+      enum:
+      - predicted
+      - unmeasured
+      - negligible
+      - proportional
     MessageLevel:
       type: string
       enum:
@@ -20431,6 +20805,24 @@ components:
           type: string
         mutating:
           type: boolean
+    PortRange:
+      type: object
+      required:
+      - first
+      - last
+      properties:
+        first:
+          type: integer
+          format: int32
+          minimum: 0
+        last:
+          type: integer
+          format: int32
+          minimum: 0
+    PortRanges:
+      type: array
+      items:
+        $ref: '#/components/schemas/PortRange'
     PrGranularity:
       type: string
       enum:
@@ -20904,6 +21296,12 @@ components:
           oneOf:
           - $ref: '#/components/schemas/EvaluationStatus'
           - type: 'null'
+    RamFit:
+      type: string
+      enum:
+      - fits
+      - fits_once_ram_is_released
+      - does_not_fit
     RegisterWorkerRequest:
       type: object
       required:
@@ -21045,6 +21443,20 @@ components:
       enum:
       - project
       - cache
+    ResourceAmount:
+      type: object
+      required:
+      - total
+      - free
+      properties:
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+        free:
+          type: integer
+          format: int64
+          minimum: 0
     RevokeInvitationRequest:
       type: object
       required:
@@ -22314,6 +22726,53 @@ components:
       - starred
       - team
       - member
+    TimeEstimate:
+      type: object
+      required:
+      - download_secs
+      - path_secs
+      - build_secs
+      - upload_secs
+      - eval_secs
+      - nar_bytes
+      - paths
+      - output_nar_bytes
+      - fallbacks
+      properties:
+        download_secs:
+          type: number
+          format: double
+        path_secs:
+          type: number
+          format: double
+        build_secs:
+          type: number
+          format: double
+        upload_secs:
+          type: number
+          format: double
+        eval_secs:
+          type: number
+          format: double
+        nar_bytes:
+          type: number
+          format: double
+        paths:
+          type: number
+          format: double
+        output_nar_bytes:
+          type: number
+          format: double
+        cores:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+        fallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Fallback'
     TopProjectBuildTime:
       type: object
       required:
@@ -22958,6 +23417,18 @@ components:
       enum:
       - pruned
       - full
+    WarmGuests:
+      type: object
+      required:
+      - size
+      - count
+      properties:
+        size:
+          $ref: '#/components/schemas/GuestSize'
+        count:
+          type: integer
+          format: int32
+          minimum: 0
     WebhookDeliveryId:
       type: string
       format: uuid
@@ -23221,6 +23692,59 @@ components:
           - number
           - 'null'
           format: float
+    WorkerProfile:
+      type: object
+      required:
+      - architectures
+      - system_features
+      - max_concurrent_builds
+      - cpu_count
+      - ram_total_mb
+      - cpu_core_score
+      properties:
+        architectures:
+          type: array
+          items:
+            type: string
+        system_features:
+          type: array
+          items:
+            type: string
+        max_concurrent_builds:
+          type: integer
+          format: int32
+          minimum: 0
+        cpu_count:
+          type: integer
+          format: int32
+          minimum: 0
+        ram_total_mb:
+          type: integer
+          format: int64
+          minimum: 0
+        cpu_core_score:
+          type: integer
+          format: int32
+          minimum: 0
+        zone:
+          type:
+          - string
+          - 'null'
+        endpoint:
+          type:
+          - string
+          - 'null'
+        build_cores:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+        exec:
+          oneOf:
+          - $ref: '#/components/schemas/ExecInventory'
+          - type: 'null'
+      additionalProperties: false
     WorkerSamplePoint:
       type: object
       required:

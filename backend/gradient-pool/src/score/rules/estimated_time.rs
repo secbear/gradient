@@ -16,7 +16,9 @@ const BYTES_PER_MB: f64 = 1_000_000.0;
 const BITS_PER_BYTE: f64 = 8.0;
 const BITS_PER_MEGABIT: f64 = 1_000_000.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Fallback {
     MissingNarSize,
@@ -33,7 +35,7 @@ pub enum Fallback {
     SubstituteCost,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TimeEstimate {
     pub download_secs: f64,
     pub path_secs: f64,

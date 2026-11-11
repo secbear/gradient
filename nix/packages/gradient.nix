@@ -181,7 +181,7 @@ craneLib.buildPackage (commonArgs // lib.optionalAttrs (gitRev != null) { GRADIE
 
     capacityTests = craneLib.cargoNextest (testArgs // {
       pname = "gradient-capacity-tests";
-      cargoNextestExtraArgs = "--no-fail-fast --test-threads 2 -E 'package(gradient-pool) | (package(gradient-scheduler) & test(capacity))'";
+      cargoNextestExtraArgs = "--no-fail-fast --test-threads 2 -E 'package(gradient-pool) | (package(gradient-scheduler) & test(capacity)) | (package(gradient-web) & (binary(team_capacity) | test(endpoints::teams::capacity))) | (package(gradient-types) & test(cli::tests))'";
     });
   };
 

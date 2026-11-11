@@ -19,7 +19,8 @@ use gradient_types::ids::{DerivationBuildId, ProjectId};
 use gradient_wire::types::{BuildRequirement, BuildSpecKind, GradientCapabilities};
 
 /// A prospective builder's resources; RAM is the usable build budget, not host memory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BuildCapacityProfile {
     pub name: String,
     pub worker_id: String,
@@ -28,7 +29,7 @@ pub struct BuildCapacityProfile {
 }
 
 impl BuildCapacityProfile {
-    pub(crate) fn validate_all(profiles: &[Self]) -> anyhow::Result<()> {
+    pub fn validate_all(profiles: &[Self]) -> anyhow::Result<()> {
         let mut names = HashSet::new();
         for profile in profiles {
             ensure!(
@@ -118,7 +119,7 @@ pub struct BuildCapacityAssessment {
     pub profiles: Vec<ProspectiveBuildWorker>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct BuildProfileAssessment {
     pub resources: BuildResourceAssessment,
     /// Fit of the model prediction, independently of the scheduler's reservation fallback.
@@ -170,11 +171,21 @@ pub struct BuildCapacitySnapshot {
     pub captured_at: NaiveDateTime,
     pub server_draining: bool,
     pub builds: Vec<ReadyBuild>,
+    pub total_ready_builds: usize,
     pub workers: Vec<BuildCapacityWorker>,
     pub instance: InstanceContext,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy)]
+pub struct BuildCapacityLimits {
+    pub builds: usize,
+    pub workers: usize,
+    pub scanned_jobs: usize,
+    pub scanned_workers: usize,
+    pub assigned_jobs_per_worker: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct BuildResourceAssessment {
     pub cores: u32,
     /// The policy reservation, not a measured peak; absent when no memory estimate exists.
@@ -184,6 +195,8 @@ pub struct BuildResourceAssessment {
     pub ram_fit: Option<RamFit>,
     pub memory_assumption: MemoryAssumption,
     pub own_samples: u32,
+    /// False when the native time estimator has neither model history nor a fleet median.
+    pub build_time_known: bool,
     pub time: TimeEstimate,
 }
 
@@ -258,6 +271,9 @@ impl BuildCapacitySnapshot {
             ram_fit,
             memory_assumption: assessed.memory_assumption,
             own_samples: build.estimate.own_samples,
+            build_time_known: build.estimate.build_ms(assessed.choice.cores).is_some()
+                || self.instance.build_time_median_ms.w1h.is_some()
+                || self.instance.build_time_median_ms.w24h.is_some(),
             time: estimated_time::estimate(&context, &worker_context, &self.instance),
         })
     }
@@ -273,6 +289,7 @@ mod tests {
         BuildCapacitySnapshot {
             captured_at: gradient_types::now(),
             server_draining: false,
+            total_ready_builds: 1,
             builds: vec![ReadyBuild {
                 id: DerivationBuildId::now_v7(),
                 project,
@@ -499,6 +516,22 @@ mod tests {
     }
 
     #[test]
+    fn capacity_time_distinguishes_unknown_from_a_zero_fleet_estimate() {
+        let mut snapshot = snapshot(BuildEstimate::default(), worker());
+        let unknown = snapshot
+            .assess(&snapshot.builds[0], &snapshot.workers[0])
+            .unwrap();
+        assert_eq!(unknown.time.build_secs, 0.0);
+        assert!(!unknown.build_time_known);
+        snapshot.instance.build_time_median_ms.w1h = Some(0.0);
+        let zero = snapshot
+            .assess(&snapshot.builds[0], &snapshot.workers[0])
+            .unwrap();
+        assert_eq!(zero.time.build_secs, 0.0);
+        assert!(zero.build_time_known);
+    }
+
+    #[test]
     fn unmeasured_builds_keep_the_instance_fallback_distinct() {
         let mut snapshot = snapshot(BuildEstimate::default(), worker());
         snapshot.instance.peak_ram_mb = Windowed {
@@ -517,6 +550,7 @@ mod tests {
         assert_eq!(assessed.memory_assumption, MemoryAssumption::Unmeasured);
         assert_eq!(assessed.ram_fit, Some(RamFit::Fits));
         assert_eq!(assessed.time.build_secs, 60.0);
+        assert!(assessed.build_time_known);
         assert!(
             assessed
                 .time

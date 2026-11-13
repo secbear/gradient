@@ -671,33 +671,44 @@ async fn n13_a_dependency_landing_in_the_same_flush_as_its_referrer_counts_for_i
 
 #[tokio::test]
 async fn n14_an_unneeded_output_does_not_complete_its_producer_twice() {
-    let e1 = EvaluationId::now_v7();
-    let seed = runtime_chain_below_x(e1)
-        .derivation(C)
-        .unneeded_output(C_OUT2, "dev")
-        .cached_output(A)
-        .references(&[(A_OUT, "a"), (B_OUT, "b")])
-        .cached_output(B)
-        .references(&[(B_OUT, "b"), (C_OUT, "c")])
-        .cached_output(C)
-        .references(&[(C_OUT, "c")])
-        .derivation(X)
-        .build_status(Queued);
-    let case = Case::start(seed).await;
+    for batched in [false, true] {
+        let e1 = EvaluationId::now_v7();
+        let seed = runtime_chain_below_x(e1)
+            .derivation(C)
+            .unneeded_output(C_OUT2, "dev")
+            .cached_output(A)
+            .references(&[(A_OUT, "a"), (B_OUT, "b")])
+            .cached_output(B)
+            .references(&[(B_OUT, "b"), (C_OUT, "c")])
+            .cached_output(C)
+            .references(&[(C_OUT, "c")])
+            .derivation(X)
+            .build_status(Queued);
+        let case = Case::start(seed).await;
+        let unneeded = commit_of(C_OUT2, "c-dev", &[(C_OUT2, "c-dev"), (C_OUT, "c")]);
 
-    case.commit_nar(commit_of(
-        C_OUT2,
-        "c-dev",
-        &[(C_OUT2, "c-dev"), (C_OUT, "c")],
-    ))
-    .await;
+        if batched {
+            let (new, repeated) = tokio::join!(
+                case.commit_nar_result(unneeded),
+                case.commit_nar_result(commit_of(C_OUT, "c", &[(C_OUT, "c")]))
+            );
+            new.expect("the unneeded output commits");
+            repeated.expect("the backed output recommits");
+        } else {
+            case.commit_nar(unneeded).await;
+        }
 
-    for path in [A, B, C] {
-        assert_eq!(case.closure_state(path).await, (true, 0), "{path}");
+        for path in [A, B, C] {
+            assert_eq!(
+                case.closure_state(path).await,
+                (true, 0),
+                "{path}, batched {batched}"
+            );
+        }
+        assert_eq!(case.queue_state(X).await, (Queued, 0));
+        case.zero_drift("the unneeded output").await;
+        case.finish().await;
     }
-    assert_eq!(case.queue_state(X).await, (Queued, 0));
-    case.zero_drift("the unneeded output").await;
-    case.finish().await;
 }
 
 #[tokio::test]

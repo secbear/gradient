@@ -9,6 +9,7 @@
 //! `freshly_present` is the caller's endpoint for that transition.
 //! A freshly present dependency still counts as missing for a referrer in the same seed, since its own ripple subtracts it.
 //! A re-push of an already backed path must not count as fresh.
+//! An unneeded output arriving does not complete its producer's closure.
 
 use std::collections::BTreeMap;
 
@@ -180,6 +181,11 @@ crate::sql! {
     DELETE_CACHED_PATHS = "DELETE FROM cached_path cp WHERE cp.hash = ANY($1) RETURNING cp.hash",
         params = [CachedPathHashes(64)];
 
+    NEEDED_OUTPUT_PRODUCERS = "SELECT DISTINCT o.derivation FROM derivation_output o \
+         JOIN derivation_build db ON db.derivation = o.derivation \
+         WHERE o.hash = ANY($1) AND o.name <> ALL(db.unneeded_outputs)",
+        params = [CachedPathHashes(64)];
+
     RIPPLE_MISSING_RUNTIME_DEPS = "SELECT derivation FROM ripple_missing_runtime_deps($1::uuid[], $2::bool) AS r(derivation)",
         params = [DerivationIds(64), Bool(true)],
         tier = Bulk;
@@ -205,13 +211,44 @@ pub async fn seed_runtime_deps(
 ) -> Result<Seeded, DbErr> {
     let mut seed: BTreeMap<DerivationId, bool> = recounted.iter().map(|d| (*d, false)).collect();
     seed.extend(freshly_present.iter().map(|d| (*d, true)));
+    seed_runtime_deps_inner(txn, seed, None).await
+}
+
+/// A newly backed output changes closure presence only when its producer needs it.
+pub async fn seed_runtime_deps_for_outputs(
+    txn: &DatabaseTransaction,
+    newly_backed: &[String],
+    affected: &[DerivationId],
+) -> Result<Seeded, DbErr> {
+    let seed = affected.iter().map(|d| (*d, false)).collect();
+    seed_runtime_deps_inner(txn, seed, Some(newly_backed)).await
+}
+
+async fn seed_runtime_deps_inner(
+    txn: &DatabaseTransaction,
+    mut seed: BTreeMap<DerivationId, bool>,
+    newly_backed: Option<&[String]>,
+) -> Result<Seeded, DbErr> {
     if seed.is_empty() {
         return Ok(Seeded::default());
     }
 
     let sorted: Vec<DerivationId> = seed.keys().copied().collect();
-    let fresh: Vec<bool> = seed.values().copied().collect();
     let _lock = crate::graph::can_start::lock_seed_shared_builds(txn, &sorted).await?;
+    if let Some(hashes) = newly_backed {
+        let needed = if hashes.is_empty() {
+            Vec::new()
+        } else {
+            derivation_ids(
+                &txn.query_all_raw(NEEDED_OUTPUT_PRODUCERS.bind([hashes.to_vec().into()]))
+                    .await?,
+            )
+        };
+        for (derivation, fresh) in &mut seed {
+            *fresh = needed.contains(derivation);
+        }
+    }
+    let fresh: Vec<bool> = seed.values().copied().collect();
     let rows = txn
         .query_all_raw(SEED_MISSING_RUNTIME_DEPS.bind([ids(&sorted), fresh.into()]))
         .await?;

@@ -17,8 +17,9 @@ use sea_orm::sea_query::LockType;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
 
 use super::{
-    A, A_OUT, B, B_OUT, B_OUT2, C, C_OUT, Case, D, D_OUT, F_OUT, F1, F2, M, M_OUT, P, P_OUT,
-    SOURCE, X, X_OUT, assert_only_unstored_outputs, chain, chain_done, commit_of, drv_nar, nar,
+    A, A_OUT, B, B_OUT, B_OUT2, C, C_OUT, C_OUT2, Case, D, D_OUT, F_OUT, F1, F2, M, M_OUT, P,
+    P_OUT, SOURCE, X, X_OUT, assert_only_unstored_outputs, chain, chain_done, commit_of, drv_nar,
+    nar,
 };
 use crate::messages::NarCommit;
 
@@ -666,6 +667,37 @@ async fn n13_a_dependency_landing_in_the_same_flush_as_its_referrer_counts_for_i
     assert_only_unstored_outputs(case.drift().await, 1, "step 1");
     let end = case.finish_with_drift().await;
     assert_only_unstored_outputs(end, 1, "the end");
+}
+
+#[tokio::test]
+async fn n14_an_unneeded_output_does_not_complete_its_producer_twice() {
+    let e1 = EvaluationId::now_v7();
+    let seed = runtime_chain_below_x(e1)
+        .derivation(C)
+        .unneeded_output(C_OUT2, "dev")
+        .cached_output(A)
+        .references(&[(A_OUT, "a"), (B_OUT, "b")])
+        .cached_output(B)
+        .references(&[(B_OUT, "b"), (C_OUT, "c")])
+        .cached_output(C)
+        .references(&[(C_OUT, "c")])
+        .derivation(X)
+        .build_status(Queued);
+    let case = Case::start(seed).await;
+
+    case.commit_nar(commit_of(
+        C_OUT2,
+        "c-dev",
+        &[(C_OUT2, "c-dev"), (C_OUT, "c")],
+    ))
+    .await;
+
+    for path in [A, B, C] {
+        assert_eq!(case.closure_state(path).await, (true, 0), "{path}");
+    }
+    assert_eq!(case.queue_state(X).await, (Queued, 0));
+    case.zero_drift("the unneeded output").await;
+    case.finish().await;
 }
 
 #[tokio::test]

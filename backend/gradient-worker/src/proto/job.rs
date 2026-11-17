@@ -603,7 +603,73 @@ impl JobUpdater {
     }
 
     pub async fn report_eval_stats(&self, report: EvalStatsReport) -> Result<()> {
-        self.send_update(JobUpdateKind::EvalStats(report)).await
+        let (version, budget) = self.eval_stats_budget()?;
+        if gradient_wire::codec::to_bytes(&report, version)?.len() <= budget {
+            return self.send_update(JobUpdateKind::EvalStats(report)).await;
+        }
+        let mut totals = report;
+        let costs = std::mem::take(&mut totals.per_entry_point);
+        let nodes = std::mem::take(&mut totals.flake_nodes);
+        let sets = std::mem::take(&mut totals.sets);
+        let subtrees = std::mem::take(&mut totals.subtrees);
+        // Send additive counters once, before a malformed row can interrupt its collection.
+        self.send_update(JobUpdateKind::EvalStats(totals)).await?;
+        self.send_eval_stats_rows(costs, |part| &mut part.per_entry_point)
+            .await?;
+        self.send_eval_stats_rows(nodes, |part| &mut part.flake_nodes)
+            .await?;
+        self.send_eval_stats_rows(sets, |part| &mut part.sets)
+            .await?;
+        self.send_eval_stats_rows(subtrees, |part| &mut part.subtrees)
+            .await
+    }
+
+    async fn send_eval_stats_rows<T: gradient_wire::codec::Proto>(
+        &self,
+        rows: Vec<T>,
+        field: fn(&mut EvalStatsReport) -> &mut Vec<T>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let (version, budget) = self.eval_stats_budget()?;
+        let mut part = EvalStatsReport::default();
+        let mut bytes = 0;
+        for row in rows {
+            let size = gradient_wire::codec::to_bytes(&row, version)?.len();
+            if size > budget {
+                if !field(&mut part).is_empty() {
+                    self.send_update(JobUpdateKind::EvalStats(part)).await?;
+                }
+                bail!("one evaluation statistic exceeds the message budget");
+            }
+            if bytes + size > budget {
+                self.send_update(JobUpdateKind::EvalStats(std::mem::take(&mut part)))
+                    .await?;
+                bytes = 0;
+            }
+            field(&mut part).push(row);
+            bytes += size;
+        }
+        self.send_update(JobUpdateKind::EvalStats(part)).await
+    }
+
+    fn eval_stats_budget(&self) -> Result<(u16, usize)> {
+        let version = self
+            .writer
+            .version()
+            .unwrap_or(*gradient_wire::messages::PROTO_VERSIONS.end());
+        let envelope = ClientMessage::JobUpdate {
+            job_id: self.job_id.clone(),
+            assignment_id: self.assignment_id.get(),
+            update: JobUpdateKind::EvalStats(EvalStatsReport::default()),
+        };
+        // A vector length can grow from a one-byte varint to a ten-byte varint.
+        let overhead = gradient_wire::codec::to_bytes(&envelope, version)?.len() + 9;
+        let budget = gradient_wire::session::frame::SAFE_INFLIGHT_MESSAGE_SIZE
+            .checked_sub(overhead)
+            .context("evaluation stats envelope exceeds the message budget")?;
+        Ok((version, budget))
     }
 
     pub async fn report_building(&self, build_id: String) -> Result<()> {
@@ -999,6 +1065,182 @@ mod tests {
             log,
         );
         (updater, reader)
+    }
+
+    #[tokio::test]
+    async fn a_small_stats_report_remains_one_update() {
+        let (conn, server_task, job_id) = server_then_client!("eval-small", |sc| {
+            let ClientMessage::JobUpdate {
+                update: JobUpdateKind::EvalStats(report),
+                ..
+            } = sc.recv().await.expect("one stats report")
+            else {
+                panic!("stats update");
+            };
+            assert_eq!(report.total_thunks, 7);
+            assert_eq!(report.per_entry_point.len(), 1);
+        });
+        let (updater, _reader) = make_updater(job_id, conn);
+        updater
+            .report_eval_stats(EvalStatsReport {
+                total_thunks: 7,
+                per_entry_point: vec![gradient_wire::types::EvalAttrCost::default()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_eval_stats_keep_every_row_and_send_totals_once_in_bounded_messages() {
+        use gradient_wire::types::{EvalAttrCost, EvalSetCost, EvalSubtreeCost, FlakeOutputNode};
+
+        let count: usize = 20_000;
+        let attrs = u64::try_from(count).expect("attribute count");
+        let nodes: Vec<_> = (0..count)
+            .map(|i| FlakeOutputNode {
+                path: format!("packages.x86_64-linux.pkg{i}"),
+                drv_path: Some(format!("/nix/store/{}-{i}.drv", "a".repeat(512))),
+                ..Default::default()
+            })
+            .collect();
+        let costs: Vec<_> = (0..count)
+            .map(|i| EvalAttrCost {
+                attr: format!("{}-{i}", "b".repeat(128)),
+                thunks: 1,
+                ..Default::default()
+            })
+            .collect();
+        let report = EvalStatsReport {
+            total_thunks: 7,
+            fn_calls: 9,
+            total_eval_ms: 123,
+            per_entry_point: costs,
+            flake_nodes: nodes,
+            sets: vec![EvalSetCost {
+                path: vec!["packages".into()],
+                startup_ms: Some(4),
+                peak_rss_mb: 5,
+            }],
+            subtrees: vec![EvalSubtreeCost {
+                path: vec!["packages".into()],
+                attrs,
+                eval_ms: 6,
+            }],
+            ..Default::default()
+        };
+        let (conn, server_task, job_id) = server_then_client!("eval-large", |sc| {
+            let mut nodes = Vec::new();
+            let mut costs = Vec::new();
+            let mut sets = Vec::new();
+            let mut subtrees = Vec::new();
+            let mut messages = 0;
+            let mut totals = (0, 0, 0);
+            loop {
+                let message = sc.recv().await.expect("stats before completion");
+                if message == ClientMessage::Draining {
+                    break;
+                }
+                let bytes = gradient_wire::codec::to_bytes(
+                    &message,
+                    *gradient_wire::messages::PROTO_VERSIONS.end(),
+                )
+                .unwrap();
+                assert!(bytes.len() <= gradient_wire::session::frame::SAFE_INFLIGHT_MESSAGE_SIZE);
+                let ClientMessage::JobUpdate {
+                    job_id,
+                    assignment_id,
+                    update: JobUpdateKind::EvalStats(part),
+                } = message
+                else {
+                    panic!("an evaluation stats update");
+                };
+                assert_eq!(job_id, "eval-large");
+                assert_eq!(assignment_id, "dispatch-1");
+                nodes.extend(part.flake_nodes);
+                costs.extend(part.per_entry_point);
+                sets.extend(part.sets);
+                subtrees.extend(part.subtrees);
+                messages += 1;
+                totals.0 += part.total_thunks;
+                totals.1 += part.fn_calls;
+                totals.2 += part.total_eval_ms;
+            }
+            assert_eq!(totals, (7, 9, 123));
+            assert!(
+                messages > 5,
+                "the original report cannot fit in one message"
+            );
+            assert_eq!(nodes.len(), count);
+            assert_eq!(costs.len(), count);
+            for (i, node) in nodes.iter().enumerate() {
+                assert_eq!(node.path, format!("packages.x86_64-linux.pkg{i}"));
+            }
+            for (i, cost) in costs.iter().enumerate() {
+                assert_eq!(cost.attr, format!("{}-{i}", "b".repeat(128)));
+                assert_eq!(cost.thunks, 1);
+            }
+            assert_eq!((sets.len(), sets[0].startup_ms), (1, Some(4)));
+            assert_eq!((subtrees.len(), subtrees[0].attrs), (1, attrs));
+        });
+        let (updater, _reader) = make_updater(job_id, conn);
+        updater.report_eval_stats(report).await.unwrap();
+        updater.writer.send(ClientMessage::Draining).await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_stats_row_is_refused_before_it_breaks_the_connection() {
+        let (conn, server_task, job_id) = server_then_client!("eval-oversized", |sc| {
+            let ClientMessage::JobUpdate {
+                update: JobUpdateKind::EvalStats(totals),
+                ..
+            } = sc.recv().await.unwrap()
+            else {
+                panic!("totals survive the oversized row");
+            };
+            assert_eq!(totals.total_thunks, 7);
+            let ClientMessage::JobUpdate {
+                update: JobUpdateKind::EvalStats(rows),
+                ..
+            } = sc.recv().await.unwrap()
+            else {
+                panic!("earlier rows survive the oversized row");
+            };
+            assert_eq!(rows.per_entry_point.len(), 1);
+            assert_eq!(rows.total_thunks, 0);
+            let ClientMessage::JobUpdate {
+                update: JobUpdateKind::EvalStats(rows),
+                ..
+            } = sc.recv().await.unwrap()
+            else {
+                panic!("buffered rows survive the oversized row");
+            };
+            assert_eq!(rows.flake_nodes.len(), 1);
+            assert_eq!(rows.flake_nodes[0].path, "packages.hello");
+            assert_eq!(sc.recv().await.unwrap(), ClientMessage::Draining);
+        });
+        let (updater, _reader) = make_updater(job_id, conn);
+        let report = EvalStatsReport {
+            total_thunks: 7,
+            per_entry_point: vec![gradient_wire::types::EvalAttrCost::default()],
+            flake_nodes: vec![
+                gradient_wire::types::FlakeOutputNode {
+                    path: "packages.hello".into(),
+                    ..Default::default()
+                },
+                gradient_wire::types::FlakeOutputNode {
+                    path: "x".repeat(gradient_wire::session::frame::SAFE_INFLIGHT_MESSAGE_SIZE),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let error = updater.report_eval_stats(report).await.unwrap_err();
+        assert!(error.to_string().contains("one evaluation statistic"));
+        updater.writer.send(ClientMessage::Draining).await.unwrap();
+        server_task.await.unwrap();
     }
 
     fn cached(path: &str) -> CachedPath {

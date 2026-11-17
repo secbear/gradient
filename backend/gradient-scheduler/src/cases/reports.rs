@@ -1470,6 +1470,22 @@ async fn r21_eval_stats_fold_into_the_metric_when_the_evaluation_settles_and_onl
     );
     case.check("step 1").await;
 
+    for attr in ["pkg.big", "pkg.small"] {
+        case.report_eval_stats(
+            W1,
+            &k,
+            EvalStatsReport {
+                per_entry_point: vec![gradient_wire::types::EvalAttrCost {
+                    attr: attr.into(),
+                    thunks: 25,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
     let spans = vec![
         span(JobPhase::Fetch, 0, 100),
         span(JobPhase::EvalFlake, 100, 200),
@@ -1480,6 +1496,14 @@ async fn r21_eval_stats_fold_into_the_metric_when_the_evaluation_settles_and_onl
         .evaluation_metric(e1)
         .await
         .expect("after 2: evaluation_metric(E1)");
+    let mut costs = case
+        .db
+        .rows::<gradient_entity::evaluation_attr_cost::Entity>()
+        .await;
+    costs.sort_by(|a, b| a.attr.cmp(&b.attr));
+    assert_eq!(costs.len(), 2, "after 2: chunked attribute costs");
+    assert_eq!((costs[0].attr.as_str(), costs[0].thunks), ("pkg.big", 25));
+    assert_eq!((costs[1].attr.as_str(), costs[1].thunks), ("pkg.small", 25));
     assert_eq!(
         (
             metric.peak_rss_mb,
@@ -1487,9 +1511,10 @@ async fn r21_eval_stats_fold_into_the_metric_when_the_evaluation_settles_and_onl
             metric.eval_flake_ms,
             metric.eval_drv_ms,
             metric.total_eval_ms,
+            metric.total_thunks,
             metric.worker_id.as_str(),
         ),
-        (512, 100, 100, 700, 900, W1),
+        (512, 100, 100, 700, 900, 1000, W1),
         "after 2: evaluation_metric(E1)"
     );
     let phases: Vec<_> = case

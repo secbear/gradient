@@ -9,6 +9,20 @@ use gradient_types::permissions::Permission;
 
 pub(super) fn validate(lookup: &EntityLookup, errors: &mut ErrorCollector) {
     for api_key in lookup.config.api_keys.values() {
+        if api_key.project.is_some() && api_key.team.is_some() {
+            errors.push(
+                format!("api_keys.{}.team", api_key.name),
+                "An API key is pinned to a team or to a project, not both",
+            );
+        }
+        if let Some(team) = &api_key.team
+            && !lookup.team_exists(team)
+        {
+            errors.push(
+                format!("api_keys.{}.team", api_key.name),
+                format!("Team '{}' does not exist", team),
+            );
+        }
         if !lookup.user_exists(&api_key.owned_by) {
             errors.push(
                 format!("api_keys.{}.owned_by", api_key.name),

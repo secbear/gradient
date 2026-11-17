@@ -45,6 +45,8 @@ const managedKey: ApiKeyInfo = {
   allowed_ips: [],
 };
 
+const teamKey = { ...unmanagedKey, team: 'platform', permissions: ['manageWorkers'] };
+
 let notify = { success: vi.fn(), failure: vi.fn() };
 const confirm = vi.fn();
 
@@ -316,14 +318,44 @@ describe('ApiKeysComponent - field checks', () => {
 });
 
 describe('ApiKeysComponent - edits', () => {
-  it('sends only a changed name, so a rename keeps the scope and permissions the dialog cannot show', () => {
-    const updateApiKey = vi.fn(() => of(unmanagedKey));
-    const fixture = setup([unmanagedKey], { updateApiKey });
+  it.each([unmanagedKey, { ...unmanagedKey, project: 'web' }, teamKey])('sends only a changed name without changing scope or permissions', (key) => {
+    const updateApiKey = vi.fn(() => of(key));
+    const fixture = setup([key], { updateApiKey });
     const component = fixture.componentInstance;
-    component.openEditDialog(unmanagedKey);
+    component.openEditDialog(key);
     component.formName = 'CI key 2';
     component.saveKey();
     expect(updateApiKey).toHaveBeenCalledWith('k1', { name: 'CI key 2' });
+  });
+
+  it('shows a team badge and read-only team scope instead of a scope selector', () => {
+    const fixture = setup([teamKey]);
+    const component = fixture.componentInstance;
+    expect((fixture.nativeElement as HTMLElement).querySelector('gr-row gr-badge')?.textContent).toBe('Team platform');
+    component.openEditDialog(teamKey);
+    fixture.detectChanges();
+    expect(component.formScope).toBe('team');
+    const scope = document.querySelector<HTMLInputElement>('#key-team')!;
+    expect(scope.value).toBe('Team platform');
+    expect(scope.readOnly).toBe(true);
+    expect(document.querySelector('.gr-dialog gr-select-button')).toBeNull();
+    expect(document.querySelector('#key-project')).toBeNull();
+    expect(document.querySelector('#key-cache')).toBeNull();
+  });
+
+  it('edits team permissions and IPs without sending team or project scope changes', () => {
+    const updateApiKey = vi.fn(() => of(teamKey));
+    const fixture = setup([teamKey], { updateApiKey });
+    const component = fixture.componentInstance;
+    component.openEditDialog(teamKey);
+    component.formPermissions = { manageWorkers: true, manageWebhooks: true };
+    component.formAllowedIps = '192.0.2.0/24';
+    component.formScope = 'project';
+    component.formProject = 'web';
+    component.saveKey();
+    expect(updateApiKey).toHaveBeenCalledWith('k1', {
+      permissions: ['manageWorkers', 'manageWebhooks'], allowed_ips: ['192.0.2.0/24'],
+    });
   });
 
   it('shows the cache and cache permissions of a cache-scoped key and keeps them on save', () => {

@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-use crate::access::{CacheAccess, Caller, caller_cache_mask, load_cache};
+use crate::access::{CacheAccess, Caller, TeamAccess, caller_cache_mask, load_cache, load_team};
 use crate::audit::Audit;
 use crate::authorization::{
-    MaybeUser, can_disconnect, generate_api_key, hash_api_key, session_claims,
+    MaybeUser, TEAM_API_KEY_PREFIX, can_disconnect, generate_api_key, hash_api_key, session_claims,
 };
 use crate::error::{WebError, WebResult};
 use crate::helpers::{OptionExt, ok_json, paginate};
@@ -55,6 +55,10 @@ enum UserRefusal {
     UnknownProjectOrNotMember { project: String },
     #[error("API key cannot pin to both a project and a cache.")]
     PinToProjectAndCache,
+    #[error("API key cannot combine a team pin with a project or cache pin.")]
+    PinToTeamAndOtherScope,
+    #[error("Team scope cannot be changed on an existing API key. Create a new key instead.")]
+    TeamKeyScopeImmutable,
     #[error("At least one permission is required for an API key.")]
     NoPermissionsSelected,
     #[error("Set API key expiry to at least 1 day.")]
@@ -80,6 +84,8 @@ impl Refusal for UserRefusal {
             | Self::ModifyOidcUserProfile => RefusalStatus::Forbidden,
             Self::UnknownProjectOrNotMember { .. }
             | Self::PinToProjectAndCache
+            | Self::PinToTeamAndOtherScope
+            | Self::TeamKeyScopeImmutable
             | Self::NoPermissionsSelected
             | Self::ApiKeyExpiryShorterThanOneDay
             | Self::InvalidVersion { .. } => RefusalStatus::BadRequest,
@@ -141,6 +147,8 @@ pub struct CreateApiKeyRequest {
     #[serde(default)]
     pub cache: Option<String>,
     #[serde(default)]
+    pub team: Option<String>,
+    #[serde(default)]
     pub allowed_ips: Option<Vec<String>>,
 }
 
@@ -151,6 +159,9 @@ pub struct PatchApiKeyRequest {
     /// An omitted field leaves the pin unchanged. A name pins the key, and JSON null unpins it.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub project: Option<Option<String>>,
+    /// Team scope is immutable; create a new key to change it.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub team: Option<Option<String>>,
     #[serde(default)]
     pub allowed_ips: Option<Vec<String>>,
 }
@@ -171,6 +182,8 @@ pub struct ApiKeyInfo {
     pub permissions: Vec<&'static str>,
     pub project: Option<String>,
     pub cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
     pub created_at: String,
     pub last_used_at: Option<String>,
     pub expires_at: Option<String>,
@@ -195,6 +208,7 @@ impl ApiKeyInfo {
             permissions,
             project: key.project.and_then(|id| pins.projects.get(&id).cloned()),
             cache: key.cache.and_then(|id| pins.caches.get(&id).cloned()),
+            team: key.team.and_then(|id| pins.teams.get(&id).cloned()),
             created_at: fmt_dt(key.created_at),
             last_used_at: last_used_or_none(key.last_used_at),
             expires_at: fmt_opt_dt(key.expires_at),
@@ -512,12 +526,14 @@ async fn resolve_project_pin(
 struct PinNames {
     projects: HashMap<ProjectId, String>,
     caches: HashMap<CacheId, String>,
+    teams: HashMap<TeamId, String>,
 }
 
 impl PinNames {
     async fn of(db: &WebDb, keys: &[MApi]) -> WebResult<Self> {
         let project_ids: Vec<ProjectId> = keys.iter().filter_map(|k| k.project).collect();
         let cache_ids: Vec<CacheId> = keys.iter().filter_map(|k| k.cache).collect();
+        let team_ids: Vec<TeamId> = keys.iter().filter_map(|k| k.team).collect();
         Ok(Self {
             projects: by_ids::<EProject, _>(db, &project_ids)
                 .await?
@@ -529,8 +545,34 @@ impl PinNames {
                 .into_iter()
                 .map(|(id, cache)| (id, cache.name))
                 .collect(),
+            teams: by_ids::<ETeam, _>(db, &team_ids)
+                .await?
+                .into_iter()
+                .map(|(id, team)| (id, team.name))
+                .collect(),
         })
     }
+}
+
+async fn resolve_team_pin(
+    db: &WebDb,
+    user: &MUser,
+    name: Option<String>,
+) -> WebResult<Option<TeamId>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let (team, _) = load_team(
+        db,
+        user,
+        None,
+        name,
+        TeamAccess::Admin {
+            reject_managed: false,
+        },
+    )
+    .await?;
+    Ok(Some(team.id))
 }
 
 async fn held_cache_permissions(
@@ -615,7 +657,7 @@ pub async fn get_keys(
     operation_id = "createUserKey",
     tag = "user",
     summary = "Create API key",
-    description = "Creates a new API key. The full key (prefixed with `GRAD`) is returned once -\nit cannot be retrieved again. Use it as `Authorization: Bearer GRAD<key>`.\nPass `expires_in_days` to make the key auto-expire; omit for no expiry.\nA cache-pinned key may only grant cache permissions the caller already\nholds; members of a project subscribed to the cache are treated as\nread-only, so they can mint read-only cache keys.",
+    description = "Creates a new API key. The full key is returned once and cannot be retrieved again. Ordinary keys use the GRAD prefix. Team keys use GTEAM. Present either token as Authorization: Bearer <token>.\nPass expires_in_days to make the key auto-expire; omit for no expiry.\nA cache-pinned key may only grant cache permissions the caller already holds; members of a project subscribed to the cache are treated as read-only, so they can mint read-only cache keys.\nA team pin requires team Admin and cannot be combined with a project or cache pin. Team keys use manageWorkers for worker operations and manageWebhooks for webhooks. Their scope cannot be changed through the API. Deleting a team deletes its pinned keys.",
     request_body = CreateApiKeyRequest,
     responses((status = OK, description = "New API key", body = String, content_type = "application/json"), WebError)
 )]
@@ -628,6 +670,9 @@ pub async fn post_keys(
     let db = state.db();
     if body.cache.is_some() && body.project.is_some() {
         return Err(UserRefusal::PinToProjectAndCache.into());
+    }
+    if body.team.is_some() && (body.project.is_some() || body.cache.is_some()) {
+        return Err(UserRefusal::PinToTeamAndOtherScope.into());
     }
     if body.expires_in_days == Some(0) {
         return Err(UserRefusal::ApiKeyExpiryShorterThanOneDay.into());
@@ -662,20 +707,28 @@ pub async fn post_keys(
         let project = resolve_project_pin(&db, user.id, body.project.clone()).await?;
         (m, project, None)
     };
+    let team_pin = resolve_team_pin(&state.web_db, &user, body.team.clone()).await?;
 
     let allowed_ips = normalize_allowed_ips(body.allowed_ips.clone())?;
     let raw_key = generate_api_key();
+    let key_hash = hash_api_key(&raw_key);
+    let verifier = if team_pin.is_some() {
+        gradient_db::api_keys::team_key_verifier(&key_hash)
+    } else {
+        key_hash
+    };
     let api_key = MApi {
         id: ApiId::now_v7(),
         owned_by: user.id,
         name: body.name.clone(),
-        key: hash_api_key(&raw_key),
+        key: verifier,
         last_used_at: *NULL_TIME,
         created_at: gradient_types::now(),
         expires_at,
         permission: mask,
         project: project_pin,
         cache: cache_pin,
+        team: team_pin,
         allowed_ips,
         ..Default::default()
     };
@@ -684,12 +737,17 @@ pub async fn post_keys(
         .await
         .map_err(|e| WebError::from_db_err(e, Resource::ApiKeyName))?;
 
-    audit.write(Action::ApiKeyCreate, EventOwner::default(), serde_json::json!({ "api_key_id": inserted.id.to_string(), "name": body.name, "expires_in_days": body.expires_in_days, "permissions_mask": mask, "project_id": project_pin.map(|id| id.to_string()), "cache_id": cache_pin.map(|id| id.to_string()), }))
+    audit.write(Action::ApiKeyCreate, EventOwner::default(), serde_json::json!({ "api_key_id": inserted.id.to_string(), "name": body.name, "expires_in_days": body.expires_in_days, "permissions_mask": mask, "project_id": project_pin.map(|id| id.to_string()), "cache_id": cache_pin.map(|id| id.to_string()), "team_id": team_pin.map(|id| id.to_string()), }))
     .await;
 
+    let prefix = if team_pin.is_some() {
+        TEAM_API_KEY_PREFIX
+    } else {
+        "GRAD"
+    };
     Ok(Json(BaseResponse {
         error: false,
-        message: format!("GRAD{}", raw_key),
+        message: format!("{prefix}{raw_key}"),
     }))
 }
 
@@ -699,7 +757,7 @@ pub async fn post_keys(
     operation_id = "patchUserKey",
     tag = "user",
     summary = "Update an API key's configurable options",
-    description = "Edit the key name, permission set, and pin to a project in place. The new permissions replace the existing set in full. Cache-pinned keys hold only cache permissions. Those keys hold only a subset of the caller's permissions on that cache. A key pinned to a cache can't also have a pin to a project. State-managed keys don't allow edits. A call with API-key authentication can't reach this endpoint. Use a session instead.",
+    description = "Edit the key name, permission set, and project pin in place. The new permissions replace the existing set in full. An omitted project pin stays unchanged, while JSON null removes it. Team scope cannot be added, removed or changed through this endpoint; create a new key instead. Team keys allow edits to their name, permissions and source IPs. Cache-pinned keys hold only cache permissions. Those keys hold only a subset of the caller's permissions on that cache. A key pinned to a cache can't also have a pin to a project. State-managed keys don't allow edits. A call with API-key authentication can't reach this endpoint. Use a session instead.",
     params(("api_id" = ApiId, Path)),
     request_body = PatchApiKeyRequest,
     responses((status = OK, description = "Updated key", body = ApiKeyInfo), WebError)
@@ -719,6 +777,9 @@ pub async fn patch_key(
     if api_key.managed {
         return Err(SharedRefusal::StateManaged(Change::Modify, Resource::ApiKey).into());
     }
+    if body.team.is_some() || (api_key.team.is_some() && body.project.is_some()) {
+        return Err(UserRefusal::TeamKeyScopeImmutable.into());
+    }
 
     let pinned_cache = api_key.cache;
     if pinned_cache.is_some() && matches!(body.project, Some(Some(_))) {
@@ -727,6 +788,16 @@ pub async fn patch_key(
 
     let previous_mask = api_key.permission;
     let previous_project = api_key.project;
+    let previous_team = api_key.team;
+    let change_project = body.project.is_some();
+    let new_project = match body.project {
+        Some(maybe_name) => resolve_project_pin(&db, user.id, maybe_name).await?,
+        None => previous_project,
+    };
+    let new_team = previous_team;
+    if new_team.is_some() && (new_project.is_some() || pinned_cache.is_some()) {
+        return Err(UserRefusal::PinToTeamAndOtherScope.into());
+    }
     let previous_name = api_key.name.clone();
     let mut active: AApi = api_key.into_active_model();
 
@@ -752,9 +823,7 @@ pub async fn patch_key(
         }
         active.permission = Set(new_mask);
     }
-    let mut new_project = previous_project;
-    if let Some(maybe_name) = body.project {
-        new_project = resolve_project_pin(&db, user.id, maybe_name).await?;
+    if change_project {
         active.project = Set(new_project);
     }
     if let Some(canon) = normalize_allowed_ips(body.allowed_ips)? {
@@ -765,7 +834,7 @@ pub async fn patch_key(
         .await
         .map_err(|e| WebError::from_db_err(e, Resource::ApiKeyName))?;
 
-    audit.write(Action::ApiKeyUpdate, EventOwner::default(), serde_json::json!({ "api_key_id": api_id.to_string(), "previous_name": previous_name, "new_name": updated.name, "previous_permissions_mask": previous_mask, "new_permissions_mask": new_mask, "previous_project_id": previous_project.map(|i| i.to_string()), "new_project_id": new_project.map(|i| i.to_string()), }))
+    audit.write(Action::ApiKeyUpdate, EventOwner::default(), serde_json::json!({ "api_key_id": api_id.to_string(), "previous_name": previous_name, "new_name": updated.name, "previous_permissions_mask": previous_mask, "new_permissions_mask": new_mask, "previous_project_id": previous_project.map(|i| i.to_string()), "new_project_id": new_project.map(|i| i.to_string()), "previous_team_id": previous_team.map(|i| i.to_string()), "new_team_id": new_team.map(|i| i.to_string()), }))
     .await;
 
     let pins = PinNames::of(&state.web_db, std::slice::from_ref(&updated)).await?;
@@ -1062,6 +1131,7 @@ mod tests {
         let pins = PinNames {
             projects: Default::default(),
             caches: [(cache, "nix-cache".to_string())].into(),
+            teams: Default::default(),
         };
 
         let info = ApiKeyInfo::new(key, &pins);

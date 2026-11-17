@@ -201,8 +201,11 @@ pub async fn decode_jwt(
         return decode_job_token(db, &jwt).await;
     }
 
+    if let Some(raw) = jwt.strip_prefix(super::api_key::TEAM_API_KEY_PREFIX) {
+        return decode_api_key(db, last_used_stamps, raw, true).await;
+    }
     if let Some(raw) = jwt.strip_prefix("GRAD") {
-        return decode_api_key(db, last_used_stamps, raw).await;
+        return decode_api_key(db, last_used_stamps, raw, false).await;
     }
 
     let claims: Cliams = verify_claims(jwt_secret, &jwt).map_err(|_| StatusCode::UNAUTHORIZED)?;
@@ -229,15 +232,21 @@ async fn decode_api_key(
     db: &WebDb,
     last_used_stamps: &Debounce<Uuid>,
     raw: &str,
+    team_key: bool,
 ) -> Result<DecodedRequest, StatusCode> {
     let key_hash = hash_api_key(raw);
-    let api_key = gradient_db::api_keys::by_key_hash(db, &key_hash)
+    let verifier = if team_key {
+        gradient_db::api_keys::team_key_verifier(&key_hash)
+    } else {
+        key_hash
+    };
+    let api_key = gradient_db::api_keys::by_key_hash(db, &verifier)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
     let now = gradient_types::now();
-    if !api_key.is_usable_at(now) {
+    if !api_key.is_usable_at(now) || api_key.team.is_some() != team_key {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -245,6 +254,7 @@ async fn decode_api_key(
         mask: api_key.permission,
         project: api_key.project,
         cache_pin: api_key.cache,
+        team_pin: api_key.team,
         allowed_ips: api_key.allowed_ips.clone().unwrap_or_default(),
     };
 
@@ -275,6 +285,7 @@ async fn decode_job_token(db: &WebDb, raw: &str) -> Result<DecodedRequest, Statu
         mask: job_mask(),
         project: Some(job.project),
         cache_pin: None,
+        team_pin: None,
         allowed_ips: Vec::new(),
     };
 

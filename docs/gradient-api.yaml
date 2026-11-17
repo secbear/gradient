@@ -11267,7 +11267,7 @@ paths:
       tags:
       - teams
       summary: List my teams
-      description: Teams that include the caller as a member, with the caller's role, sorted by display name. Callers need a signed-in session. Team endpoints don't accept API keys.
+      description: Teams that include the caller as a member, with the caller's role, sorted by display name. Callers need a signed-in session.
       operationId: listTeams
       responses:
         '200':
@@ -11294,7 +11294,7 @@ paths:
       tags:
       - teams
       summary: Create team
-      description: Create a team and make the caller its admin. Use `--permissions-create-team` to control which users can create teams. Requests need a signed-in session. API keys cannot use team endpoints.
+      description: Create a team and make the caller its admin. Use `--permissions-create-team` to control which users can create teams. Requests need a signed-in session.
       operationId: createTeam
       requestBody:
         content:
@@ -11357,7 +11357,7 @@ paths:
       tags:
       - teams
       summary: Get team
-      description: Members of the team and superusers can read it.
+      description: Members of the team and superusers can read it. API keys must be pinned to this team and additionally need manageWorkers.
       operationId: getTeam
       parameters:
       - name: team
@@ -11813,7 +11813,7 @@ paths:
       tags:
       - webhooks
       summary: List team webhooks
-      description: Requires Admin role in the team.
+      description: Requires Admin role in the team (API keys must be pinned to this team and additionally need `manageWebhooks`).
       operationId: listTeamWebhooks
       parameters:
       - name: team
@@ -11847,7 +11847,7 @@ paths:
       - webhooks
       summary: Create a team webhook
       description: |-
-        Requires Admin role in the team. The response carries the signing `secret` once; it is
+        Requires Admin role in the team (API keys must be pinned to this team and additionally need `manageWebhooks`). The response carries the signing `secret` once; it is
         never returned again (use `rotate-secret` to replace it).
       operationId: createTeamWebhook
       parameters:
@@ -12164,7 +12164,7 @@ paths:
       tags:
       - teams
       summary: List team workers
-      description: A team worker serves every project that grants the team its workers. `last_error` is shown to team Admins.
+      description: A team worker serves every project that grants the team its workers. `last_error` is shown to team Admins. API keys must be pinned to this team and additionally need manageWorkers.
       operationId: listTeamWorkers
       parameters:
       - name: team
@@ -12197,7 +12197,7 @@ paths:
       tags:
       - teams
       summary: Register team worker
-      description: Needs Admin in the team. The worker answers the server challenge with `<team id>:<token>` or `*:<token>` in its peers file. `token` is returned only when the server generated it.
+      description: Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. The worker answers the server challenge with `<team id>:<token>` or `*:<token>` in its peers file. `token` is returned only when the server generated it.
       operationId: registerTeamWorker
       parameters:
       - name: team
@@ -12236,7 +12236,7 @@ paths:
       - teams
       summary: Assess local ordinary-build capacity
       description: |-
-        Needs Admin in the team. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.
+        Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.
 
         Returns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.
 
@@ -12280,7 +12280,7 @@ paths:
       tags:
       - teams
       summary: Read missing worker capabilities
-      description: 'Needs Admin in the team. Sums the waiting evaluations of projects granting the team its workers that no connected worker eligible for the project can take: builds per system and features, plus fetch and evaluation gaps. `projects` takes comma-separated project names or IDs and limits the sum to those granting projects.'
+      description: 'Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Sums the waiting evaluations of projects granting the team its workers that no connected worker eligible for the project can take: builds per system and features, plus fetch and evaluation gaps. `projects` takes comma-separated project names or IDs and limits the sum to those granting projects.'
       operationId: getTeamWorkerDemand
       parameters:
       - name: team
@@ -12317,7 +12317,7 @@ paths:
       tags:
       - teams
       summary: Delete team worker
-      description: Needs Admin in the team.
+      description: Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers.
       operationId: deleteTeamWorker
       parameters:
       - name: team
@@ -12353,7 +12353,7 @@ paths:
       tags:
       - teams
       summary: Change team worker
-      description: Needs Admin in the team. Deactivating aborts the worker's running jobs of the granted projects.
+      description: Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Deactivating aborts the worker's running jobs of the granted projects.
       operationId: patchTeamWorker
       parameters:
       - name: team
@@ -12692,12 +12692,10 @@ paths:
       - user
       summary: Create API key
       description: |-
-        Creates a new API key. The full key (prefixed with `GRAD`) is returned once -
-        it cannot be retrieved again. Use it as `Authorization: Bearer GRAD<key>`.
-        Pass `expires_in_days` to make the key auto-expire; omit for no expiry.
-        A cache-pinned key may only grant cache permissions the caller already
-        holds; members of a project subscribed to the cache are treated as
-        read-only, so they can mint read-only cache keys.
+        Creates a new API key. The full key is returned once and cannot be retrieved again. Ordinary keys use the GRAD prefix. Team keys use GTEAM. Present either token as Authorization: Bearer <token>.
+        Pass expires_in_days to make the key auto-expire; omit for no expiry.
+        A cache-pinned key may only grant cache permissions the caller already holds; members of a project subscribed to the cache are treated as read-only, so they can mint read-only cache keys.
+        A team pin requires team Admin and cannot be combined with a project or cache pin. Team keys use manageWorkers for worker operations and manageWebhooks for webhooks. Their scope cannot be changed through the API. Deleting a team deletes its pinned keys.
       operationId: createUserKey
       requestBody:
         content:
@@ -12788,7 +12786,7 @@ paths:
       tags:
       - user
       summary: Update an API key's configurable options
-      description: Edit the key name, permission set, and pin to a project in place. The new permissions replace the existing set in full. Cache-pinned keys hold only cache permissions. Those keys hold only a subset of the caller's permissions on that cache. A key pinned to a cache can't also have a pin to a project. State-managed keys don't allow edits. A call with API-key authentication can't reach this endpoint. Use a session instead.
+      description: Edit the key name, permission set, and project pin in place. The new permissions replace the existing set in full. An omitted project pin stays unchanged, while JSON null removes it. Team scope cannot be added, removed or changed through this endpoint; create a new key instead. Team keys allow edits to their name, permissions and source IPs. Cache-pinned keys hold only cache permissions. Those keys hold only a subset of the caller's permissions on that cache. A key pinned to a cache can't also have a pin to a project. State-managed keys don't allow edits. A call with API-key authentication can't reach this endpoint. Use a session instead.
       operationId: patchUserKey
       parameters:
       - name: api_id
@@ -14637,6 +14635,10 @@ components:
           type:
           - string
           - 'null'
+        team:
+          type:
+          - string
+          - 'null'
         created_at:
           type: string
         last_used_at:
@@ -16480,6 +16482,10 @@ components:
           - string
           - 'null'
         cache:
+          type:
+          - string
+          - 'null'
+        team:
           type:
           - string
           - 'null'
@@ -20410,6 +20416,11 @@ components:
           - string
           - 'null'
           description: An omitted field leaves the pin unchanged. A name pins the key, and JSON null unpins it.
+        team:
+          type:
+          - string
+          - 'null'
+          description: Team scope is immutable; create a new key to change it.
         allowed_ips:
           type:
           - array

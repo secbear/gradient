@@ -119,17 +119,23 @@
 
     <gr-divider />
 
-    <gr-form-field label="Scope">
-      <gr-select-button
-        [options]="scopeChoices()"
-        [(ngModel)]="formScope"
-        optionLabel="label"
-        optionValue="value"
-        (ngModelChange)="onScopeChange()"
-      />
-    </gr-form-field>
+    @if (editingKey()?.team; as team) {
+      <gr-form-field label="Scope" for="key-team" hint="Team scope cannot be changed.">
+        <input grInput id="key-team" [value]="'Team ' + team" readonly />
+      </gr-form-field>
+    } @else {
+      <gr-form-field label="Scope">
+        <gr-select-button
+          [options]="scopeChoices()"
+          [(ngModel)]="formScope"
+          optionLabel="label"
+          optionValue="value"
+          (ngModelChange)="onScopeChange()"
+        />
+      </gr-form-field>
+    }
 
-    @if (formScope === 'project') {
+    @if (!editingKey()?.team && formScope === 'project') {
       <gr-form-field label="Project" for="key-project" [invalid]="!!projectError()" [error]="projectError() ?? ''">
         <gr-select
           inputId="key-project"
@@ -142,7 +148,7 @@
       </gr-form-field>
     }
 
-    @if (formScope === 'cache') {
+    @if (!editingKey()?.team && formScope === 'cache') {
       <gr-form-field label="Cache" for="key-cache" [invalid]="!!cacheError()" [error]="cacheError() ?? ''">
         <gr-select
           inputId="key-cache"

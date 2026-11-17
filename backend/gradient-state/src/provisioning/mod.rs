@@ -68,7 +68,7 @@ pub(super) async fn apply_state_to_database(
     app.apply_caches(&config.caches).await?;
     app.apply_project_teams(&config.projects, &team_ids).await?;
     app.apply_cache_teams(&config.caches, &team_ids).await?;
-    app.apply_api_keys(&config.api_keys).await?;
+    app.apply_api_keys(&config.api_keys, &team_ids).await?;
     app.apply_workers(&config.workers, &team_ids).await?;
     app.unmark_removed_entities(config, delete_state).await?;
 

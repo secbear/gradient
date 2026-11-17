@@ -6,7 +6,7 @@
 
 { pkgs, ... }: let
   # The secret formats are taken from the cache test, where the provisioner is accepting them.
-  # The API key file is holding the SHA-256 of the raw token behind the `GRAD${stateApiKeyRaw}` bearer.
+  # API key files hold SHA-256 digests of raw tokens, without transport prefixes.
   statePwHash = pkgs.writeText "state-pw-hash" "$argon2id$v=19$m=4096,t=3,p=1$c29tZXNhbHQxMjM0NQ$hIKBEy9SOWlnAlcwUv2PLPBdsMkKhVlCyjTxaWIK+v4";
   stateSshKey = pkgs.writeText "state-ssh-key" ''
     -----BEGIN OPENSSH PRIVATE KEY-----
@@ -22,6 +22,8 @@
   stateIntSecret = pkgs.writeText "state-int-secret" "C9ve6tvVONhtbRzFks56HQlYQotlRmXel/5NFLk/HjbSFGc+IZjCGfxegW2NKpY5";
   stateApiKeyRaw = "statecitokenrawvalue";
   stateApiKeyHash = pkgs.writeText "state-api-key" (builtins.hashString "sha256" stateApiKeyRaw);
+  stateTeamApiKeyRaw = "stateteamtokenrawvalue";
+  stateTeamApiKeyHash = pkgs.writeText "state-team-api-key" (builtins.hashString "sha256" stateTeamApiKeyRaw);
 in {
   value = pkgs.testers.runNixOSTest ({ pkgs, lib, ... }: {
     name = "gradient-api";
@@ -129,6 +131,13 @@ in {
                 owned_by = "statemember";
                 permissions = [ "viewProject" ];
                 project = "stateproject";
+              };
+
+              api_keys.state-team-key = {
+                key_file = toString stateTeamApiKeyHash;
+                owned_by = "stateadmin";
+                permissions = [ "manageWorkers" ];
+                team = "stateteam";
               };
 
               workers = {

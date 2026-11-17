@@ -10,7 +10,7 @@ use crate::error::{ErrorCode, WebError, WebResult};
 use crate::helpers::{OptionExt, ok_json};
 use crate::refusal::SharedRefusal;
 use crate::resource::Resource;
-use crate::scope::{Admin, TeamScope};
+use crate::scope::{AdminWithApiKey, TeamScope, can};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::NaiveDateTime;
@@ -218,14 +218,14 @@ fn unavailable() -> WebError {
     operation_id = "assessTeamBuildCapacity",
     tag = "teams",
     summary = "Assess local ordinary-build capacity",
-    description = "Needs Admin in the team. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.\n\nReturns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.\n\nProspective profiles require unregistered UUIDs and planned build/network enable flags. Tracked profiles require active, build-enabled registrations owned by this team. Saved registration flags additionally restrict their network capability. A connected tracked worker never receives a starting-profile assessment, even when it has no scoped live-worker index. All profile fits remain conditional on valid worker tokens, project caches and matching advertised resources.\n\ninclude_waiting_builds adds once-only RAM credit for a waiting build in the selected batch. The credit is the native usable-budget difference, not raw reserved RAM. Fit does not imply a free slot. Unknown predictions remain distinct from fallback reservations. captured_at is not a metrics sample timestamp.",
+    description = "Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.\n\nReturns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.\n\nProspective profiles require unregistered UUIDs and planned build/network enable flags. Tracked profiles require active, build-enabled registrations owned by this team. Saved registration flags additionally restrict their network capability. A connected tracked worker never receives a starting-profile assessment, even when it has no scoped live-worker index. All profile fits remain conditional on valid worker tokens, project caches and matching advertised resources.\n\ninclude_waiting_builds adds once-only RAM credit for a waiting build in the selected batch. The credit is the native usable-budget difference, not raw reserved RAM. Fit does not imply a free slot. Unknown predictions remain distinct from fallback reservations. captured_at is not a metrics sample timestamp.",
     params(TeamPath),
     request_body = CapacityAssessmentRequest,
     responses((status = OK, description = "OK", body = CapacityAssessmentResponse), WebError)
 )]
 #[tracing::instrument(skip_all)]
 pub async fn post_team_capacity_assessment(
-    TeamScope { team, db, .. }: TeamScope<Admin>,
+    TeamScope { team, db, .. }: TeamScope<AdminWithApiKey<can::ManageWorkers>>,
     Extension(scheduler): Extension<Arc<Scheduler>>,
     Extension(admission): Extension<CapacityAssessmentAdmission>,
     Json(body): Json<CapacityAssessmentRequest>,

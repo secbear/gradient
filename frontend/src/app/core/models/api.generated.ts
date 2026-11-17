@@ -107,6 +107,7 @@ export interface ApiKeyInfo {
   permissions: string[];
   project?: string | null;
   cache?: string | null;
+  team?: string | null;
   created_at: string;
   last_used_at?: string | null;
   expires_at?: string | null;
@@ -732,6 +733,7 @@ export interface CreateApiKeyRequest {
   permissions: string[];
   project?: string | null;
   cache?: string | null;
+  team?: string | null;
   allowed_ips?: string[] | null;
 }
 
@@ -2052,6 +2054,7 @@ export interface PatchApiKeyRequest {
   name?: string | null;
   permissions?: string[] | null;
   project?: string | null;
+  team?: string | null;
   allowed_ips?: string[] | null;
 }
 

@@ -77,6 +77,52 @@ fn secret_files_default_to_empty() {
 }
 
 #[test]
+fn state_api_key_scope_preserves_legacy_configs_and_validates_team_pins() {
+    let mut cfg: StateConfiguration = serde_json::from_str(WITHOUT_OPTIONAL_FIELDS).unwrap();
+    let key: crate::StateApiKey = serde_json::from_value(serde_json::json!({
+        "name": "automation",
+        "key_file": "/dev/null",
+        "owned_by": "alice",
+        "permissions": ["manageWorkers"]
+    }))
+    .unwrap();
+    assert!(key.team.is_none());
+    cfg.api_keys.insert("automation".into(), key);
+    cfg.teams.insert(
+        "platform".into(),
+        serde_json::from_value(serde_json::json!({
+            "name": "platform", "display_name": "Platform"
+        }))
+        .unwrap(),
+    );
+
+    for (project, team, error_field) in [
+        (None, None, None),
+        (Some("acme"), None, None),
+        (None, Some("platform"), None),
+        (
+            Some("acme"),
+            Some("platform"),
+            Some("api_keys.automation.team"),
+        ),
+        (None, Some("ghost"), Some("api_keys.automation.team")),
+        (Some("ghost"), None, Some("api_keys.automation.project")),
+    ] {
+        let key = cfg.api_keys.get_mut("automation").unwrap();
+        key.project = project.map(str::to_owned);
+        key.team = team.map(str::to_owned);
+        let validation = cfg.validate();
+        let fields: Vec<&str> = validation.errors.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            error_field.into_iter().collect::<Vec<_>>(),
+            "project={project:?}, team={team:?}: {:?}",
+            validation.errors
+        );
+    }
+}
+
+#[test]
 fn a_task_without_exec_enabled_keeps_exec_jobs_off() {
     let cfg: StateConfiguration = serde_json::from_str(WITHOUT_OPTIONAL_FIELDS).unwrap();
     assert!(!cfg.tasks["web"].exec_enabled);

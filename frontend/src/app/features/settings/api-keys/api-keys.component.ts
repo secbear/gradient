@@ -37,7 +37,7 @@ import { PermissionPickerComponent } from '@shared/ui';
 import { CreateCacheDialogComponent, dialogFormChangesSinceOpen, fieldChecks, injectCanCreateCache, injectRevealFirstInvalid, isIpNetwork, splitLines } from '@shared/forms';
 import { SettingsNavComponent } from '../settings-nav/settings-nav.component';
 
-type ScopeType = 'none' | 'project' | 'cache';
+type ScopeType = 'none' | 'project' | 'cache' | 'team';
 
 interface KeyFields {
   name: string;
@@ -53,7 +53,7 @@ function keyChanges(key: ApiKeyInfo, next: KeyFields): PatchApiKeyRequest {
   const patch: PatchApiKeyRequest = {};
   if (next.name !== key.name) patch.name = next.name;
   if (!sameList(next.permissions, key.permissions)) patch.permissions = next.permissions;
-  if (next.project !== (key.project ?? null)) patch.project = next.project;
+  if (!key.team && next.project !== (key.project ?? null)) patch.project = next.project;
   if (!sameList(next.allowed_ips, key.allowed_ips ?? [])) patch.allowed_ips = next.allowed_ips;
   return patch;
 }
@@ -235,7 +235,7 @@ export class ApiKeysComponent implements OnInit {
     this.editingKey.set(key);
     this.formName = key.name;
     this.formExpiresInDays = null;
-    this.formScope = key.cache ? 'cache' : key.project ? 'project' : 'none';
+    this.formScope = key.team ? 'team' : key.cache ? 'cache' : key.project ? 'project' : 'none';
     this.formProject = key.project ?? null;
     this.formCache = key.cache ?? null;
     if (key.cache && !this.cacheOptions().some((option) => option.value === key.cache)) {
@@ -278,10 +278,11 @@ export class ApiKeysComponent implements OnInit {
     return this.formScope === 'cache' ? this.availableCachePermissions() : this.availablePermissions();
   }
 
-  /// An edit request cannot move a key between a cache pin and a project pin.
+  /// Team and cache scopes cannot change through an edit request.
   scopeChoices(): { label: string; value: ScopeType }[] {
     const editing = this.editingKey();
     if (!editing) return this.scopeOptions;
+    if (editing.team) return [{ label: `Team ${editing.team}`, value: 'team' }];
     if (editing.cache) return this.scopeOptions.filter((option) => option.value === 'cache');
     return this.scopeOptions.filter((option) => option.value !== 'cache');
   }
@@ -445,6 +446,7 @@ export class ApiKeysComponent implements OnInit {
 
   scopeBadge(key: ApiKeyInfo): string {
     const label = (options: SelectOption[], name: string) => options.find((option) => option.value === name)?.label ?? name;
+    if (key.team) return `Team ${key.team}`;
     if (key.cache) return `Cache ${label(this.cacheOptions(), key.cache)}`;
     if (key.project) return label(this.projectOptions(), key.project);
     return 'Any project';

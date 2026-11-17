@@ -12,6 +12,12 @@ use sea_orm::{
     QueryFilter, QueryOrder,
 };
 
+const TEAM_KEY_VERIFIER_PREFIX: &str = "team:";
+
+pub fn team_key_verifier(key_hash: &str) -> String {
+    format!("{TEAM_KEY_VERIFIER_PREFIX}{key_hash}")
+}
+
 pub async fn of_user<C: ConnectionTrait>(db: &C, user: UserId) -> Result<Vec<MApi>, DbErr> {
     EApi::find()
         .filter(CApi::OwnedBy.eq(user))
@@ -56,7 +62,13 @@ pub async fn by_key_hash<C: ConnectionTrait>(
     db: &C,
     key_hash: &str,
 ) -> Result<Option<MApi>, DbErr> {
-    EApi::find().filter(CApi::Key.eq(key_hash)).one(db).await
+    let query = EApi::find().filter(CApi::Key.eq(key_hash));
+    let query = if key_hash.starts_with(TEAM_KEY_VERIFIER_PREFIX) {
+        query.filter(CApi::Team.is_not_null())
+    } else {
+        query
+    };
+    query.one(db).await
 }
 
 pub async fn stamp_last_used<C: ConnectionTrait>(

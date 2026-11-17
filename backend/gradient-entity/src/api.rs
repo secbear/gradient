@@ -8,7 +8,7 @@ use chrono::NaiveDateTime;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ApiId, CacheId, ProjectId, UserId};
+use crate::ids::{ApiId, CacheId, ProjectId, TeamId, UserId};
 
 #[derive(Clone, Default, PartialEq, DeriveEntityModel, Deserialize, Serialize)]
 #[sea_orm(table_name = "api")]
@@ -26,6 +26,8 @@ pub struct Model {
     pub permission: i64,
     pub project: Option<ProjectId>,
     pub cache: Option<CacheId>,
+    #[serde(default)]
+    pub team: Option<TeamId>,
     /// Source CIDRs allowed to present this key. `None` or an empty list is allowing any source.
     #[sea_orm(column_type = "Array(std::sync::Arc::new(ColumnType::Text))", nullable)]
     pub allowed_ips: Option<Vec<String>>,
@@ -55,6 +57,14 @@ pub enum Relation {
         on_update = "Cascade"
     )]
     Cache,
+    #[sea_orm(
+        belongs_to = "super::team::Entity",
+        from = "Column::Team",
+        to = "super::team::Column::Id",
+        on_delete = "Cascade",
+        on_update = "Cascade"
+    )]
+    Team,
 }
 
 impl Model {
@@ -78,6 +88,7 @@ impl std::fmt::Debug for Model {
             .field("permission", &self.permission)
             .field("project", &self.project)
             .field("cache", &self.cache)
+            .field("team", &self.team)
             .field("allowed_ips", &self.allowed_ips)
             .finish()
     }

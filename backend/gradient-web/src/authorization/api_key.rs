@@ -7,13 +7,18 @@
 use crate::permissions::PermissionMask;
 use gradient_db::exec_jobs::tokens::ResolvedJobToken;
 use gradient_types::ids::CacheId;
-use gradient_types::{ApiId, ExecJobAttemptId, ExecJobId, MSession, ProjectId, TaskId, UserId};
+use gradient_types::{
+    ApiId, ExecJobAttemptId, ExecJobId, MSession, ProjectId, TaskId, TeamId, UserId,
+};
+
+pub const TEAM_API_KEY_PREFIX: &str = "GTEAM";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiKeyContext {
     pub mask: PermissionMask,
     pub project: Option<ProjectId>,
     pub cache_pin: Option<CacheId>,
+    pub team_pin: Option<TeamId>,
     pub allowed_ips: Vec<String>,
 }
 

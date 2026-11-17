@@ -287,16 +287,7 @@ pub async fn export_state<C: ConnectionTrait>(db: &C) -> Result<StateConfigurati
         }
         config.api_keys.insert(
             k.name.clone(),
-            StateApiKey {
-                name: k.name.clone(),
-                key_file: String::new(),
-                owned_by: name_or_blank(&username, k.owned_by),
-                permissions: mask_to_vec(k.permission)
-                    .into_iter()
-                    .map(|p| p.as_wire_name().to_string())
-                    .collect(),
-                project: k.project.and_then(|id| project_name.get(&id).cloned()),
-            },
+            export_api_key(k, &username, &project_name, &team_name)?,
         );
     }
 
@@ -419,6 +410,36 @@ fn export_task(
         flake_input_overrides: HashMap::new(),
         actions: Vec::new(),
     }
+}
+
+fn export_api_key(
+    key: &gradient_entity::api::Model,
+    username: &HashMap<UserId, String>,
+    project_name: &HashMap<ProjectId, String>,
+    team_name: &HashMap<TeamId, String>,
+) -> Result<StateApiKey, DbErr> {
+    let team = key
+        .team
+        .map(|id| {
+            team_name.get(&id).cloned().ok_or_else(|| {
+                DbErr::Custom(format!(
+                    "Team '{id}' referenced by API key '{}' not found during state export",
+                    key.name
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(StateApiKey {
+        name: key.name.clone(),
+        key_file: String::new(),
+        owned_by: name_or_blank(username, key.owned_by),
+        permissions: mask_to_vec(key.permission)
+            .into_iter()
+            .map(|p| p.as_wire_name().to_string())
+            .collect(),
+        project: key.project.and_then(|id| project_name.get(&id).cloned()),
+        team,
+    })
 }
 
 fn export_team(
@@ -791,6 +812,65 @@ fn nix_string(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn api_key_scope_names_survive_export_round_trip() {
+        let user = UserId::now_v7();
+        let project = ProjectId::now_v7();
+        let team = TeamId::now_v7();
+        let usernames = HashMap::from([(user, "alice".to_string())]);
+        let projects = HashMap::from([(project, "acme".to_string())]);
+        let teams = HashMap::from([(team, "platform".to_string())]);
+        for (project_id, team_id, project_name, team_name) in [
+            (None, None, None, None),
+            (Some(project), None, Some("acme"), None),
+            (None, Some(team), None, Some("platform")),
+        ] {
+            let key = gradient_entity::api::Model {
+                name: "automation".into(),
+                owned_by: user,
+                permission: gradient_types::permissions::mask_from(&[
+                    gradient_types::permissions::Permission::ManageWorkers,
+                ]),
+                project: project_id,
+                team: team_id,
+                ..Default::default()
+            };
+            let exported = export_api_key(&key, &usernames, &projects, &teams).unwrap();
+            let value = serde_json::to_value(&exported).unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "name": "automation",
+                    "key_file": "",
+                    "owned_by": "alice",
+                    "permissions": ["manageWorkers"],
+                    "project": project_name,
+                    "team": team_name
+                })
+            );
+            let reread: StateApiKey = serde_json::from_value(value).unwrap();
+            assert_eq!(reread.project.as_deref(), project_name);
+            assert_eq!(reread.team.as_deref(), team_name);
+        }
+    }
+
+    #[test]
+    fn api_key_export_rejects_a_missing_team_name() {
+        let team = TeamId::now_v7();
+        let key = gradient_entity::api::Model {
+            name: "automation".into(),
+            team: Some(team),
+            ..Default::default()
+        };
+        let error =
+            export_api_key(&key, &HashMap::new(), &HashMap::new(), &HashMap::new()).unwrap_err();
+        assert!(
+            matches!(&error, DbErr::Custom(message)
+                if message.contains("automation") && message.contains(&team.to_string())),
+            "{error}"
+        );
+    }
 
     #[test]
     fn export_team_worker_names_its_team() {

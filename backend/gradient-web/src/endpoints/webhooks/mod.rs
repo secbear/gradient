@@ -43,7 +43,9 @@ impl WebhookMount {
         match self {
             Self::Project => "`manageWebhooks` on the project",
             Self::Cache => "`manageCacheWebhooks` on the cache",
-            Self::Team => "Admin role in the team",
+            Self::Team => {
+                "Admin role in the team (API keys must be pinned to this team and additionally need `manageWebhooks`)"
+            }
             Self::Instance => "superuser",
         }
     }

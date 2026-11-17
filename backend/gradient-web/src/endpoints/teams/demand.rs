@@ -7,7 +7,7 @@
 use crate::api_spec::TeamPath;
 use crate::error::{WebError, WebResult};
 use crate::helpers::ok_json;
-use crate::scope::{Admin, TeamScope};
+use crate::scope::{AdminWithApiKey, TeamScope, can};
 use axum::Json;
 use axum::extract::Query;
 use gradient_db::WebDb;
@@ -28,12 +28,12 @@ pub struct DemandQuery {
     operation_id = "getTeamWorkerDemand",
     tag = "teams",
     summary = "Read missing worker capabilities",
-    description = "Needs Admin in the team. Sums the waiting evaluations of projects granting the team its workers that no connected worker eligible for the project can take: builds per system and features, plus fetch and evaluation gaps. `projects` takes comma-separated project names or IDs and limits the sum to those granting projects.",
+    description = "Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Sums the waiting evaluations of projects granting the team its workers that no connected worker eligible for the project can take: builds per system and features, plus fetch and evaluation gaps. `projects` takes comma-separated project names or IDs and limits the sum to those granting projects.",
     params(TeamPath, DemandQuery),
     responses((status = OK, description = "OK", body = TeamDemand), WebError)
 )]
 pub async fn get_team_worker_demand(
-    TeamScope { team, db, .. }: TeamScope<Admin>,
+    TeamScope { team, db, .. }: TeamScope<AdminWithApiKey<can::ManageWorkers>>,
     Query(query): Query<DemandQuery>,
 ) -> WebResult<Json<BaseResponse<TeamDemand>>> {
     let projects = match query.projects.as_deref() {

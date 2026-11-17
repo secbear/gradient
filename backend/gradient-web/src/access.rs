@@ -32,6 +32,12 @@ pub(crate) enum AccessRefusal {
         "An API key pinned to one project can't use this endpoint. This endpoint can show data from all projects."
     )]
     ProjectPinnedKeyOnAllProjectsEndpoint,
+    #[error("An API key pinned to one project cannot access team resources.")]
+    ProjectPinnedKeyOnTeamEndpoint,
+    #[error("A team-pinned API key cannot access this endpoint.")]
+    TeamPinnedKeyOnEndpoint,
+    #[error("Team worker and webhook endpoints require an API key pinned to that team.")]
+    TeamPinnedKeyRequired,
     #[error("API key is pinned to a different cache.")]
     KeyPinnedToDifferentCache,
     #[error("Requests to this cache need the \"{}\" permission.", .0.permission_label())]
@@ -117,6 +123,9 @@ pub async fn load_project(
     project_name: String,
     access: ProjectAccess,
 ) -> WebResult<MProject> {
+    if api_key.is_some_and(|k| k.team_pin.is_some()) {
+        return Err(AccessRefusal::TeamPinnedKeyOnEndpoint.into());
+    }
     if api_key.is_some_and(|k| k.cache_pin.is_some()) {
         return Err(AccessRefusal::CachePinnedKeyOnEndpoint.into());
     }
@@ -175,6 +184,9 @@ pub async fn load_task(
     task_name: String,
     access: TaskAccess,
 ) -> WebResult<(MProject, MTask)> {
+    if api_key.is_some_and(|k| k.team_pin.is_some()) {
+        return Err(AccessRefusal::TeamPinnedKeyOnEndpoint.into());
+    }
     if api_key.is_some_and(|k| k.cache_pin.is_some()) {
         return Err(AccessRefusal::CachePinnedKeyOnEndpoint.into());
     }
@@ -226,6 +238,9 @@ pub async fn load_cache(
     cache_name: String,
     access: CacheAccess,
 ) -> WebResult<MCache> {
+    if api_key.is_some_and(|k| k.team_pin.is_some()) {
+        return Err(AccessRefusal::TeamPinnedKeyOnEndpoint.into());
+    }
     let label = Resource::Cache;
 
     let cache = get_any_cache_by_name(db, cache_name)
@@ -366,7 +381,9 @@ pub fn api_key_is_pinned_to_other_project(
     api_key: Option<&ApiKeyContext>,
     project_id: ProjectId,
 ) -> bool {
-    api_key.is_some_and(|ctx| ctx.project.is_some_and(|pinned| pinned != project_id))
+    api_key.is_some_and(|ctx| {
+        ctx.team_pin.is_some() || ctx.project.is_some_and(|pinned| pinned != project_id)
+    })
 }
 
 pub fn key_limited_project_mask(
@@ -439,7 +456,9 @@ async fn is_cache_project_subscriber(
     api_key: Option<&ApiKeyContext>,
 ) -> WebResult<bool> {
     if api_key.is_some_and(|key| {
-        key.cache_pin.is_some() || !mask_grants(key.mask, Permission::ViewProject)
+        key.cache_pin.is_some()
+            || key.team_pin.is_some()
+            || !mask_grants(key.mask, Permission::ViewProject)
     }) {
         return Ok(false);
     }
@@ -630,6 +649,8 @@ pub(crate) fn reject_managed_cache(cache: &MCache) -> WebResult<()> {
 pub enum TeamAccess {
     Member,
     Admin { reject_managed: bool },
+    MemberWithApiKey { permission: Permission },
+    AdminWithApiKey { permission: Permission },
 }
 
 pub async fn load_team(
@@ -639,16 +660,40 @@ pub async fn load_team(
     team_name: String,
     access: TeamAccess,
 ) -> WebResult<(MTeam, Option<TeamRole>)> {
-    crate::authorization::reject_api_key_authentication(api_key)?;
+    match access {
+        TeamAccess::MemberWithApiKey { permission }
+        | TeamAccess::AdminWithApiKey { permission } => {
+            if let Some(key) = api_key {
+                if key.cache_pin.is_some() {
+                    return Err(AccessRefusal::CachePinnedKeyOnEndpoint.into());
+                }
+                if key.project.is_some() {
+                    return Err(AccessRefusal::ProjectPinnedKeyOnTeamEndpoint.into());
+                }
+                if key.team_pin.is_none() {
+                    return Err(AccessRefusal::TeamPinnedKeyRequired.into());
+                }
+                if !mask_grants(key.mask, permission) {
+                    return Err(SharedRefusal::MissingPermission.into());
+                }
+            }
+        }
+        _ => crate::authorization::reject_api_key_authentication(api_key)?,
+    }
 
     let team = gradient_db::teams::by_name(db, &team_name)
         .await?
         .or_not_found(Resource::Team)?;
+    if api_key.is_some_and(|key| key.team_pin != Some(team.id)) {
+        return Err(WebError::not_found(Resource::Team));
+    }
     let role = gradient_db::teams::team_role_of(db, team.id, user.id).await?;
 
     match (access, role) {
         (_, None) if !user.superuser => return Err(WebError::not_found(Resource::Team)),
-        (TeamAccess::Admin { .. }, Some(TeamRole::Member)) if !user.superuser => {
+        (TeamAccess::Admin { .. } | TeamAccess::AdminWithApiKey { .. }, Some(TeamRole::Member))
+            if !user.superuser =>
+        {
             return Err(SharedRefusal::MissingPermission.into());
         }
         _ => {}
@@ -1155,6 +1200,7 @@ mod tests {
             mask,
             project,
             cache_pin: None,
+            team_pin: None,
             allowed_ips: Vec::new(),
         }
     }
@@ -1436,6 +1482,7 @@ mod tests {
             mask: crate::permissions::cache_view_mask(),
             project: None,
             cache_pin: Some(cache_fixture(false).id),
+            team_pin: None,
             allowed_ips: Vec::new(),
         }
     }
@@ -1668,6 +1715,7 @@ mod tests {
                 "a0000000-0000-0000-0000-000000000001"
             ))),
             cache_pin: None,
+            team_pin: None,
             allowed_ips: Vec::new(),
         }
     }

@@ -70,6 +70,12 @@ pub(crate) fn refuse_request_outside_api_key_scope(
             matched_path.ok_or(AccessRefusal::CachePinnedKeyOnEndpoint)?,
         )?;
     }
+    if key.team_pin.is_some() {
+        let route = api_route(matched_path.ok_or(AccessRefusal::TeamPinnedKeyOnEndpoint)?);
+        if !is_under(route, "/teams/{team}") && route != "/user/keys/permissions" {
+            return Err(AccessRefusal::TeamPinnedKeyOnEndpoint);
+        }
+    }
     if key.project.is_some() {
         reject_api_key_for_route_reading_all_projects(
             matched_path.ok_or(AccessRefusal::ProjectPinnedKeyOnAllProjectsEndpoint)?,

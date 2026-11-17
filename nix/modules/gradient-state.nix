@@ -1155,8 +1155,9 @@
       key_file = mkOption {
         type = types.str;
         description = ''
-          File containing the lowercase hex SHA-256 digest of the API token, without its `GRAD`
-          prefix. The server only stores and compares hashes. Generate it with
+          File containing the lowercase hex SHA-256 digest of the raw API token, without the
+          `GRAD` or `GTEAM` transport prefix. The server only stores and compares hashes.
+          Generate it from the raw token with
           {command}`printf %s "$TOKEN" | sha256sum | cut -d' ' -f1`.
         '';
       };
@@ -1179,10 +1180,13 @@
       project = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = ''
-          Project the key is restricted to. `null` allows every project the owner is a member
-          of.
-        '';
+        description = "Project that restricts the key when no team is set.";
+      };
+
+      team = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Team that restricts the key, mutually exclusive with project.";
       };
     };
   });

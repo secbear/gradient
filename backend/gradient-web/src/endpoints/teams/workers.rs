@@ -15,7 +15,7 @@ use crate::error::{WebError, WebResult};
 use crate::helpers::{OptionExt, ok_json};
 use crate::refusal::SharedRefusal;
 use crate::resource::Resource;
-use crate::scope::{Admin, Member, TeamScope};
+use crate::scope::{AdminWithApiKey, MemberWithApiKey, TeamScope, can};
 use axum::extract::State;
 use axum::{Extension, Json};
 use chrono::NaiveDateTime;
@@ -129,7 +129,7 @@ async fn find_team_worker(db: &WebDb, team: TeamId, worker_id: &str) -> WebResul
     operation_id = "listTeamWorkers",
     tag = "teams",
     summary = "List team workers",
-    description = "A team worker serves every project that grants the team its workers. `last_error` is shown to team Admins.",
+    description = "A team worker serves every project that grants the team its workers. `last_error` is shown to team Admins. API keys must be pinned to this team and additionally need manageWorkers.",
     params(TeamPath),
     responses((status = OK, description = "OK", body = Vec<TeamWorkerEntry>), WebError)
 )]
@@ -140,7 +140,7 @@ pub async fn get_team_workers(
         user,
         db,
         ..
-    }: TeamScope<Member>,
+    }: TeamScope<MemberWithApiKey<can::ManageWorkers>>,
     Extension(scheduler): Extension<Arc<Scheduler>>,
 ) -> WebResult<Json<BaseResponse<Vec<TeamWorkerEntry>>>> {
     let failures = (user.superuser || role == Some(TeamRole::Admin))
@@ -164,13 +164,13 @@ pub async fn get_team_workers(
     operation_id = "registerTeamWorker",
     tag = "teams",
     summary = "Register team worker",
-    description = "Needs Admin in the team. The worker answers the server challenge with `<team id>:<token>` or `*:<token>` in its peers file. `token` is returned only when the server generated it.",
+    description = "Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. The worker answers the server challenge with `<team id>:<token>` or `*:<token>` in its peers file. `token` is returned only when the server generated it.",
     params(TeamPath),
     request_body = RegisterWorkerRequest,
     responses((status = OK, description = "OK", body = RegisteredTeamWorker), WebError)
 )]
 pub async fn post_team_worker(
-    TeamScope { team, user, .. }: TeamScope<Admin>,
+    TeamScope { team, user, .. }: TeamScope<AdminWithApiKey<can::ManageWorkers>>,
     state: State<Arc<ServerState>>,
     audit: Audit,
     Extension(scheduler): Extension<Arc<Scheduler>>,
@@ -245,7 +245,7 @@ pub async fn post_team_worker(
     operation_id = "patchTeamWorker",
     tag = "teams",
     summary = "Change team worker",
-    description = "Needs Admin in the team. Deactivating aborts the worker's running jobs of the granted projects.",
+    description = "Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Deactivating aborts the worker's running jobs of the granted projects.",
     params(TeamPath, ("worker_id" = String, Path)),
     request_body = PatchWorkerRequest,
     responses((status = OK, description = "OK", body = String, content_type = "application/json"), WebError)
@@ -253,7 +253,7 @@ pub async fn post_team_worker(
 pub async fn patch_team_worker(
     TeamScope {
         team, db, params, ..
-    }: TeamScope<Admin>,
+    }: TeamScope<AdminWithApiKey<can::ManageWorkers>>,
     audit: Audit,
     Extension(scheduler): Extension<Arc<Scheduler>>,
     Json(body): Json<PatchWorkerRequest>,
@@ -318,14 +318,14 @@ pub async fn patch_team_worker(
     operation_id = "deleteTeamWorker",
     tag = "teams",
     summary = "Delete team worker",
-    description = "Needs Admin in the team.",
+    description = "Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers.",
     params(TeamPath, ("worker_id" = String, Path)),
     responses((status = OK, description = "OK", body = String, content_type = "application/json"), WebError)
 )]
 pub async fn delete_team_worker(
     TeamScope {
         team, db, params, ..
-    }: TeamScope<Admin>,
+    }: TeamScope<AdminWithApiKey<can::ManageWorkers>>,
     audit: Audit,
     Extension(scheduler): Extension<Arc<Scheduler>>,
 ) -> WebResult<Json<BaseResponse<String>>> {

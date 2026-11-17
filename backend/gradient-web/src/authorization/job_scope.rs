@@ -162,6 +162,32 @@ mod tests {
         for (method, path, params) in [
             (Method::GET, "/api/v1/user", vec![]),
             (Method::GET, "/api/v1/workers", vec![]),
+            (Method::GET, "/api/v1/teams/{team}", vec![("team", "infra")]),
+            (
+                Method::GET,
+                "/api/v1/teams/{team}/workers",
+                vec![("team", "infra")],
+            ),
+            (
+                Method::POST,
+                "/api/v1/teams/{team}/workers",
+                vec![("team", "infra")],
+            ),
+            (
+                Method::GET,
+                "/api/v1/teams/{team}/workers/demand",
+                vec![("team", "infra")],
+            ),
+            (
+                Method::POST,
+                "/api/v1/teams/{team}/workers/capacity-assessment",
+                vec![("team", "infra")],
+            ),
+            (
+                Method::POST,
+                "/api/v1/teams/{team}/webhooks",
+                vec![("team", "infra")],
+            ),
             (
                 Method::GET,
                 "/api/v1/projects/{project}",

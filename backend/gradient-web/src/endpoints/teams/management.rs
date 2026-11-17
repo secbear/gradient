@@ -14,7 +14,7 @@ use crate::helpers::ok_json;
 use crate::json_body::JsonBody;
 use crate::names::{TeamDisplayName, TeamName};
 use crate::resource::Resource;
-use crate::scope::{AdminUnmanaged, Member, TeamScope};
+use crate::scope::{AdminUnmanaged, MemberWithApiKey, TeamScope, can};
 use axum::extract::{Query, State};
 use axum::{Extension, Json};
 use gradient_core::ServerState;
@@ -122,7 +122,7 @@ fn blank_to_none(value: String) -> Option<String> {
     operation_id = "listTeams",
     tag = "teams",
     summary = "List my teams",
-    description = "Teams that include the caller as a member, with the caller's role, sorted by display name. Callers need a signed-in session. Team endpoints don't accept API keys.",
+    description = "Teams that include the caller as a member, with the caller's role, sorted by display name. Callers need a signed-in session.",
     responses((status = OK, description = "OK", body = Vec<TeamSummary>), WebError)
 )]
 pub async fn get_teams(
@@ -171,7 +171,7 @@ pub async fn get_team_name_available(
     operation_id = "createTeam",
     tag = "teams",
     summary = "Create team",
-    description = "Create a team and make the caller its admin. Use `--permissions-create-team` to control which users can create teams. Requests need a signed-in session. API keys cannot use team endpoints.",
+    description = "Create a team and make the caller its admin. Use `--permissions-create-team` to control which users can create teams. Requests need a signed-in session.",
     request_body = MakeTeamRequest,
     responses((status = OK, description = "Team created", body = String, content_type = "application/json"), WebError)
 )]
@@ -237,12 +237,12 @@ pub async fn put_team(
     operation_id = "getTeam",
     tag = "teams",
     summary = "Get team",
-    description = "Members of the team and superusers can read it.",
+    description = "Members of the team and superusers can read it. API keys must be pinned to this team and additionally need manageWorkers.",
     params(TeamPath),
     responses((status = OK, description = "OK", body = TeamResponse), WebError)
 )]
 pub async fn get_team(
-    TeamScope { team, role, .. }: TeamScope<Member>,
+    TeamScope { team, role, .. }: TeamScope<MemberWithApiKey<can::ManageWorkers>>,
 ) -> WebResult<Json<BaseResponse<TeamResponse>>> {
     Ok(ok_json(TeamResponse::new(team, role)))
 }

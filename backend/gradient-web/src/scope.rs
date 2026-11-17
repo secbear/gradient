@@ -195,6 +195,8 @@ pub struct Readable;
 pub struct Member;
 pub struct Admin;
 pub struct AdminUnmanaged;
+pub struct MemberWithApiKey<P>(PhantomData<P>);
+pub struct AdminWithApiKey<P>(PhantomData<P>);
 pub struct Requires<P>(PhantomData<P>);
 pub struct RequiresUnmanaged<P>(PhantomData<P>);
 
@@ -314,6 +316,18 @@ impl TeamRule for Admin {
 impl TeamRule for AdminUnmanaged {
     const ACCESS: TeamAccess = TeamAccess::Admin {
         reject_managed: true,
+    };
+}
+
+impl<P: RequiredPermission> TeamRule for MemberWithApiKey<P> {
+    const ACCESS: TeamAccess = TeamAccess::MemberWithApiKey {
+        permission: P::PERMISSION,
+    };
+}
+
+impl<P: RequiredPermission> TeamRule for AdminWithApiKey<P> {
+    const ACCESS: TeamAccess = TeamAccess::AdminWithApiKey {
+        permission: P::PERMISSION,
     };
 }
 

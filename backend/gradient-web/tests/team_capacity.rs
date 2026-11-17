@@ -11,7 +11,7 @@ use gradient_entity::ids::*;
 use gradient_entity::team_user::TeamRole;
 use gradient_entity::{team_project, team_worker, worker_registration};
 use gradient_fixtures::ids::{project_id, team_id};
-use gradient_fixtures::mock::{all_statements, empty_db};
+use gradient_fixtures::mock::{all_statements, empty_db, exec_ok, mock_db};
 use gradient_fixtures::rows::{team, team_member, user};
 use gradient_fixtures::test_date;
 use gradient_pool::estimate::BuildEstimate;
@@ -51,6 +51,30 @@ fn scoped_db(role: TeamRole, superuser: bool) -> (MockDatabase, String) {
             .append_query_results([vec![team_member(role)]]),
         auth,
     )
+}
+
+fn scoped_key_db(role: TeamRole, superuser: bool) -> (MockDatabase, String) {
+    let raw = "c".repeat(64);
+    let key = gradient_entity::api::Model {
+        owned_by: gradient_fixtures::ids::user_id(),
+        key: gradient_db::api_keys::team_key_verifier(&gradient_web::authorization::hash_api_key(
+            &raw,
+        )),
+        permission: gradient_types::permissions::Permission::ManageWorkers.bit(),
+        team: Some(team_id()),
+        ..Default::default()
+    };
+    let db = mock_db()
+        .append_query_results([vec![key.clone()]])
+        .append_exec_results([exec_ok()])
+        .append_query_results([vec![key]])
+        .append_query_results([vec![gradient_entity::user::Model {
+            superuser,
+            ..user()
+        }]])
+        .append_query_results([vec![team()]])
+        .append_query_results([vec![team_member(role)]]);
+    (db, format!("Bearer GTEAM{raw}"))
 }
 
 fn grants(db: MockDatabase, projects: &[ProjectId]) -> MockDatabase {
@@ -329,8 +353,12 @@ async fn a_member_cannot_assess_capacity() {
 
 #[tokio::test]
 async fn requested_projects_require_worker_grants_even_for_a_superuser() {
-    for superuser in [false, true] {
-        let (db, auth) = scoped_db(TeamRole::Admin, superuser);
+    for (superuser, key) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (db, auth) = if key {
+            scoped_key_db(TeamRole::Admin, superuser)
+        } else {
+            scoped_db(TeamRole::Admin, superuser)
+        };
         let test = CapacityTest::start(grants(db, &[project_id()]), auth).await;
         let outside = ProjectId::now_v7();
         let res = test
@@ -344,8 +372,12 @@ async fn requested_projects_require_worker_grants_even_for_a_superuser() {
 
 #[tokio::test]
 async fn omitted_projects_mean_worker_grants_and_an_empty_list_means_none() {
-    for explicit_empty in [false, true] {
-        let (db, auth) = scoped_db(TeamRole::Admin, false);
+    for (explicit_empty, key) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (db, auth) = if key {
+            scoped_key_db(TeamRole::Admin, false)
+        } else {
+            scoped_db(TeamRole::Admin, false)
+        };
         let test = CapacityTest::start(grants(db, &[project_id()]), auth).await;
         test.enqueue(build(project_id(), 0, BuildEstimate::default()))
             .await;

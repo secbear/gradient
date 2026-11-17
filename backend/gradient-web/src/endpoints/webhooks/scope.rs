@@ -148,8 +148,8 @@ impl FromRequestParts<Arc<ServerState>> for WebhookOwner {
                 &user,
                 api_key.as_ref(),
                 params.param("team")?,
-                TeamAccess::Admin {
-                    reject_managed: false,
+                TeamAccess::AdminWithApiKey {
+                    permission: Permission::ManageWebhooks,
                 },
             )
             .await?;

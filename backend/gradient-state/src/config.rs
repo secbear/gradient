@@ -245,6 +245,8 @@ pub struct StateApiKey {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

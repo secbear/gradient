@@ -22,7 +22,7 @@ Two ways to obtain a token:
 | Token | Source | Form |
 |---|---|---|
 | Session | `POST /auth/basic/login` or `gradient login` | JWT |
-| API key | **Settings -> API Keys** or `POST /user/keys` | `GRAD...` |
+| API key | **Settings -> API Keys** or `POST /user/keys` | `GRAD...` for project/cache keys, `GTEAM...` for team keys |
 
 Responses use the envelope `{ "error": false, "message": <payload> }`. Set `error` to `true` on failure and place the reason in `message`.
 
@@ -34,6 +34,10 @@ Responses use the envelope `{ "error": false, "message": <payload> }`. Set `erro
 - The `allowed_ips` field can limit a key to a list of CIDR blocks. Requests from other sources receive `403 forbidden_source_ip`.
 - The server reads `X-Forwarded-For` only from proxies listed in `http.trustedProxies`.
 - API keys cannot create, edit or delete other API keys. Only a session can do this.
+- A key pinned to a team can read its details and workers with `manageWorkers`. Worker changes, demand and capacity assessments also require the owner's team Admin role. Team webhooks separately require `manageWebhooks` and team Admin. Team settings, membership and grants remain session-only.
+- Team, project and cache pins cannot be combined. A team Admin can set the `team` field when issuing a key. Deleting the team also deletes its keys.
+- Team scope cannot be added, removed or changed through the API. Create a new key instead.
+- Upgrade all server instances before issuing team-pinned keys. Older servers do not enforce team pins.
 
 ```sh
 curl -X POST https://gradient.example.com/api/v1/user/keys \
@@ -79,7 +83,7 @@ Each path below upgrades to a WebSocket. On every resource change, the server pu
 
 ## Binary Cache
 
-The cache endpoints sit at the host root and carry no `/api/v1` prefix. Private caches require Basic authentication over HTTP. The username can be anything. Use a session or an API key with cache scope as the password. See [netrc](../guides/share-a-cache.md#1-use-the-cache-on-a-machine) for one way to pass credentials. API keys can't create caches and can't use team endpoints.
+The cache endpoints sit at the host root and carry no `/api/v1` prefix. Private caches require Basic authentication over HTTP. The username can be anything. Use a session or an API key with cache scope as the password. See [netrc](../guides/share-a-cache.md#1-use-the-cache-on-a-machine) for one way to pass credentials. API keys can't create caches. Cache-pinned keys can't use team endpoints.
 
 | Method | Path | Description |
 |---|---|---|

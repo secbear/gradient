@@ -18,6 +18,7 @@ mod websocket_credential_recheck;
 
 pub use self::api_key::{
     ApiKeyContext, DecodedRequest, JobPrincipal, MaybeApiKey, Principal, RateLimitBucketOwner,
+    TEAM_API_KEY_PREFIX,
 };
 pub use self::external_login::{PasswordLogin, sign_in_external};
 pub use self::identity_connect::{ConnectRefusal, can_disconnect, connect_identity};

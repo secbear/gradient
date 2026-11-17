@@ -655,6 +655,18 @@ api("GET", "projects/stateproject", token=state_key)  # viewProject granted -> a
 api("PATCH", "projects/stateproject", token=state_key, expect_error=True,
     body=json.dumps({"display_name": "hijack"}))  # mask lacks ManageProjectSettings
 
+state_project_key = next(k for k in api("GET", "user/keys", token=member_token)
+                         if k["name"] == "state-ci-key")
+assert state_project_key["project"] == "stateproject" and "team" not in state_project_key
+state_team_key = next(k for k in api("GET", "user/keys", token=sa_token)
+                      if k["name"] == "state-team-key")
+assert state_team_key["team"] == "stateteam" and state_team_key["project"] is None
+assert state_team_key["managed"] and state_team_key["permissions"] == ["manageWorkers"]
+team_token = "GTEAMstateteamtokenrawvalue"
+status("GET", "teams/stateteam/workers", token=team_token)
+status("GET", "projects/stateproject", token=team_token, code=403)
+status("GET", "teams/stateteam/workers", token=state_key, code=403)
+
 # ── Phase 8e: ssh-ng ─────────────────────────────────────────────────────────
 banner("Phase 8e: ssh-ng")
 machine.wait_for_open_port(2222)

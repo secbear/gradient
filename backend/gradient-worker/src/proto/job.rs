@@ -218,12 +218,15 @@ async fn download_segment(url: &str) -> Result<Vec<u8>> {
         .get(url)
         .send()
         .await
-        .with_context(|| format!("eval-cache GET {url}"))?
+        .map_err(reqwest::Error::without_url)
+        .context("eval-cache GET")?
         .error_for_status()
-        .with_context(|| format!("eval-cache GET {url} returned non-2xx"))?
+        .map_err(reqwest::Error::without_url)
+        .context("eval-cache GET returned non-2xx")?
         .bytes()
         .await
-        .with_context(|| format!("read eval-cache body of {url}"))?
+        .map_err(reqwest::Error::without_url)
+        .context("read eval-cache body")?
         .to_vec())
 }
 
@@ -419,7 +422,7 @@ impl JobUpdater {
             GrantTarget::Put { url } => {
                 gradient_worker_client::object_put::put_object(&url, bytes.to_vec().into(), None)
                     .await
-                    .with_context(|| format!("eval-cache PUT {url}"))?;
+                    .context("eval-cache PUT")?;
                 Ok(())
             }
             other => bail!("an eval-cache upload cannot use {other:?}"),
@@ -1239,6 +1242,35 @@ mod tests {
         };
         let error = updater.report_eval_stats(report).await.unwrap_err();
         assert!(error.to_string().contains("one evaluation statistic"));
+        updater.writer.send(ClientMessage::Draining).await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eval_cache_errors_keep_the_status_without_presigned_credentials() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let storage = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&storage)
+            .await;
+        let url = format!("{}/segment?X-Amz-Signature=secret-marker", storage.uri());
+        let download = download_segment(&url).await.unwrap_err();
+        let (conn, server_task, job_id) = server_then_client!("eval-cache-error", |sc| {
+            assert_eq!(sc.recv().await.unwrap(), ClientMessage::Draining);
+        });
+        let (updater, _reader) = make_updater(job_id, conn);
+        let upload = updater
+            .send_eval_cache(1, b"segment", GrantTarget::Put { url })
+            .await
+            .unwrap_err();
+        for error in [download, upload] {
+            let chain = format!("{error:#}");
+            assert!(chain.contains("403"), "{chain}");
+            assert!(!chain.contains("secret-marker"), "{chain}");
+            assert!(!chain.contains("X-Amz-Signature"), "{chain}");
+        }
         updater.writer.send(ClientMessage::Draining).await.unwrap();
         server_task.await.unwrap();
     }

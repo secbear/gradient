@@ -386,12 +386,16 @@ async fn team_admin_worker_key_registers_updates_and_deletes_workers() {
         }
         db = db.append_query_results([vec![worker.clone()]]);
         if operation == "update" {
-            db = db.append_query_results([vec![worker]]);
+            db = db.append_query_results([vec![team_worker::Model {
+                active: false,
+                ..worker
+            }]]);
         }
         db = db
             .append_query_results([Vec::<team_project::Model>::new()])
             .append_exec_results([exec_ok()]);
-        let server = make_test_server(db.into_connection());
+        let connection = db.into_connection();
+        let server = make_test_server(connection.clone());
         let res = worker_request(&server, operation)
             .add_header("authorization", bearer_team_key(&raw))
             .await;
@@ -399,6 +403,14 @@ async fn team_admin_worker_key_registers_updates_and_deletes_workers() {
         if operation == "register" {
             let body: serde_json::Value = res.json();
             assert_eq!(body["message"]["token"].as_str().map(str::len), Some(64));
+        }
+        if operation == "update" {
+            let statements = all_statements(connection.into_transaction_log());
+            let update = statements
+                .iter()
+                .find(|statement| statement.sql.starts_with("UPDATE \"team_worker\""))
+                .unwrap();
+            assert!(update.to_string().contains("\"active\" = FALSE"));
         }
     }
 }
@@ -673,7 +685,15 @@ async fn team_key_migration_preserves_old_keys_and_prevents_automatic_scope_expa
         .await
         .unwrap();
     let old = db.find::<api::Entity>(old.id).await.unwrap();
-    Migrator::down(&connection, Some(1)).await.unwrap();
+    let error = Migrator::down(&connection, Some(1)).await.unwrap_err();
+    assert!(error.to_string().contains("irreversible"));
+    assert_eq!(db.find::<api::Entity>(old.id).await.unwrap(), old);
+    // Build the pre-upgrade schema only in this disposable database.
+    db.execute(
+        "ALTER TABLE public.api DROP COLUMN team; \
+         DELETE FROM seaql_migrations WHERE version = 'm20261130_000000_team_api_keys';",
+    )
+    .await;
     Migrator::up(&connection, None).await.unwrap();
     assert_eq!(db.find::<api::Entity>(old.id).await.unwrap(), old);
     let key = api::Model {
@@ -787,8 +807,15 @@ async fn team_key_migration_preserves_old_keys_and_prevents_automatic_scope_expa
         .exec_without_returning(&connection)
         .await
         .unwrap();
-    Migrator::down(&connection, Some(1)).await.unwrap();
-    Migrator::up(&connection, None).await.unwrap();
+    let error = Migrator::down(&connection, Some(1)).await.unwrap_err();
+    assert!(error.to_string().contains("irreversible"));
+    assert!(db.find::<api::Entity>(key.id).await.is_some());
+    api::Entity::delete_by_id(key.id)
+        .exec(&connection)
+        .await
+        .unwrap();
+    let error = Migrator::down(&connection, Some(1)).await.unwrap_err();
+    assert!(error.to_string().contains("irreversible"));
     assert!(db.find::<api::Entity>(key.id).await.is_none());
     assert!(db.find::<api::Entity>(old.id).await.is_some());
     db.finish().await;

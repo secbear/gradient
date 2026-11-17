@@ -149,6 +149,7 @@ async fn create_key_returns_the_token_string() {
             expires_in_days: None,
             project: None,
             cache: None,
+            team: None,
             allowed_ips: None,
         })
         .await
@@ -179,6 +180,7 @@ async fn edit_api_key_patches_by_id() {
                 name: Some("deploy".into()),
                 permissions: None,
                 project: None,
+                team: None,
                 allowed_ips: None,
             },
         )

@@ -17,10 +17,6 @@ const UP: &str = "ALTER TABLE public.api \
     CREATE INDEX api_team_idx ON public.api (team) WHERE team IS NOT NULL; \
     CREATE UNIQUE INDEX api_team_verifier_unique ON public.api (key) WHERE team IS NOT NULL;";
 
-const DOWN: &str = "DELETE FROM public.api WHERE team IS NOT NULL; \
-    ALTER TABLE public.api DROP CONSTRAINT api_team_scope_exclusive, \
-        DROP CONSTRAINT api_team_verifier_scope, DROP COLUMN team;";
-
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -31,8 +27,10 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.get_connection().execute_unprepared(DOWN).await?;
-        Ok(())
+    async fn down(&self, _: &SchemaManager) -> Result<(), DbErr> {
+        Err(DbErr::Migration(
+            "m20261130_000000_team_api_keys is irreversible: older state provisioners can recreate team keys without their scope"
+                .into(),
+        ))
     }
 }

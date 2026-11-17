@@ -269,6 +269,7 @@ pub async fn handle(cmd: Commands, out: Output) {
                             expires_in_days,
                             project: api_key_project,
                             cache,
+                            team: None,
                             allowed_ips: (!allowed_ips.is_empty()).then_some(allowed_ips),
                         })
                         .await
@@ -298,6 +299,7 @@ pub async fn handle(cmd: Commands, out: Output) {
                                 name,
                                 permissions: (!permissions.is_empty()).then_some(permissions),
                                 project: api_key_project,
+                                team: None,
                                 allowed_ips: (!allowed_ips.is_empty()).then_some(allowed_ips),
                             },
                         )

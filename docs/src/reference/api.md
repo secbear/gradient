@@ -38,6 +38,7 @@ Responses use the envelope `{ "error": false, "message": <payload> }`. Set `erro
 - Team, project and cache pins cannot be combined. A team Admin can set the `team` field when issuing a key. Deleting the team also deletes its keys.
 - Team scope cannot be added, removed or changed through the API. Create a new key instead.
 - Upgrade all server instances before issuing team-pinned keys. Older servers do not enforce team pins.
+- The team-key migration cannot be reversed. Older state provisioners can recreate team keys without their scope.
 
 ```sh
 curl -X POST https://gradient.example.com/api/v1/user/keys \

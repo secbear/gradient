@@ -93,6 +93,14 @@ mod tests {
 
     #[test]
     fn resource_measurements_survive_export_and_missing_values_stay_null() {
+        #[derive(Debug, Default, PartialEq)]
+        struct Measurements {
+            cpu_time_ms: Option<i64>,
+            avg_cpu_pct: Option<f64>,
+            disk_read_bytes: Option<i64>,
+            disk_write_bytes: Option<i64>,
+        }
+
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -126,18 +134,28 @@ mod tests {
                 )
                 .await
                 .expect("export measurements");
-                let rows: Vec<(Option<i64>, Option<f64>, Option<i64>, Option<i64>)> = conn
+                let rows: Vec<Measurements> = conn
                     .prepare("SELECT cpu_time_ms, avg_cpu_pct, disk_read_bytes, disk_write_bytes FROM derivation_metric ORDER BY cpu_time_ms DESC")
                     .expect("resource query")
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                    .query_map([], |row| Ok(Measurements {
+                        cpu_time_ms: row.get(0)?,
+                        avg_cpu_pct: row.get(1)?,
+                        disk_read_bytes: row.get(2)?,
+                        disk_write_bytes: row.get(3)?,
+                    }))
                     .expect("rows")
                     .collect::<Result<_, _>>()
                     .expect("resource values");
                 assert_eq!(
                     rows,
                     vec![
-                        (Some(1234), Some(42.5), Some(1048576), Some(2097152)),
-                        (None, None, None, None),
+                        Measurements {
+                            cpu_time_ms: Some(1234),
+                            avg_cpu_pct: Some(42.5),
+                            disk_read_bytes: Some(1048576),
+                            disk_write_bytes: Some(2097152),
+                        },
+                        Measurements::default(),
                     ]
                 );
                 db.finish().await;

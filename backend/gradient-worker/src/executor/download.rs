@@ -27,10 +27,20 @@ use gradient_worker_client::nar::NarReader;
 use gradient_worker_client::nar_recv::NarPayload;
 
 #[derive(Debug)]
-pub(crate) struct FixedOutputMismatch(pub String);
+pub(crate) struct FixedOutputMismatch {
+    pub output_path: String,
+    pub expected: Vec<u8>,
+    pub actual: [u8; 32],
+}
 impl fmt::Display for FixedOutputMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "fixed output hash mismatch for {}", self.0)
+        write!(
+            f,
+            "fixed output hash mismatch for {}: expected sha256:{}, got sha256:{}",
+            self.output_path,
+            hex::encode(&self.expected),
+            hex::encode(self.actual),
+        )
     }
 }
 impl std::error::Error for FixedOutputMismatch {}
@@ -143,9 +153,11 @@ async fn download_with(
         (FixedHash::Recursive(d), _) => (packed.sha256, true, d),
     };
     if digest.as_slice() != expected.as_slice() {
-        return Err(anyhow::Error::new(FixedOutputMismatch(
-            spec.output_path.clone(),
-        )));
+        return Err(anyhow::Error::new(FixedOutputMismatch {
+            output_path: spec.output_path.clone(),
+            expected: expected.clone(),
+            actual: digest,
+        }));
     }
     let ca = format!(
         "fixed:{}sha256:{}",
@@ -449,6 +461,18 @@ mod tests {
             .unwrap_err();
 
         assert!(err.downcast_ref::<FixedOutputMismatch>().is_some(), "{err}");
+        assert!(
+            err.to_string().contains(
+                "expected sha256:48dd65c80ea3cfa8edf1efaffd1916d4fdcccaec9b65df5f850f7f2754a8c314"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(
+                "got sha256:98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4"
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test]

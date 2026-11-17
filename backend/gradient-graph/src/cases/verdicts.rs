@@ -121,7 +121,7 @@ async fn v02_stream_completion_with_nothing_blocking_goes_straight_to_the_verdic
     let e1 = EvaluationId::now_v7();
     let case = Case::start(
         finished_entry_point(e1)
-            .task_option(|task| task.retry_failed_builds = false)
+            .task_option(|task| task.retry_failed_builds = true)
             .derivation(F)
             .walked()
             .entry_point("pkg.f")

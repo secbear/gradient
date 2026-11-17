@@ -143,14 +143,29 @@ fn requeue_closure_update(blocked: &str, upstream_answer: &str) -> String {
     )
 }
 
-/// A task with `retry_failed_builds` off keeps its permanent failures until a user retries them.
-fn kept_failed_cte_body() -> String {
+/// New evaluations may retry old failures, but completing this stream must keep its own failures.
+fn kept_failed_cte_body(keep_current_failures: bool) -> String {
+    let current_failure = if keep_current_failures {
+        format!(
+            "EXISTS (SELECT 1 FROM build_attempt ba \
+                     JOIN build_job bj ON bj.id = ba.build_job \
+                     WHERE ba.derivation_build = kf.id AND ba.outcome = {} \
+                       AND bj.evaluation = $1)",
+            crate::sql::status::attempt_outcome(AttemptOutcome::Failed),
+        )
+    } else {
+        "false".to_owned()
+    };
     let kept_permanent = format!(
         "SELECT kf.derivation FROM derivation_build kf \
-         WHERE kf.status = {failed_permanent} AND kf.derivation IN (SELECT derivation FROM closure) \
-           AND EXISTS (SELECT 1 FROM evaluation e JOIN task t ON t.id = e.task \
-                       WHERE e.id = $1 AND NOT t.retry_failed_builds)",
+         WHERE kf.status IN ({failed_permanent}, {failed_timeout}) \
+           AND kf.derivation IN (SELECT derivation FROM closure) \
+           AND ((kf.status = {failed_permanent} \
+                 AND EXISTS (SELECT 1 FROM evaluation e JOIN task t ON t.id = e.task \
+                             WHERE e.id = $1 AND NOT t.retry_failed_builds)) \
+                OR {current_failure})",
         failed_permanent = crate::sql::status::build(BuildStatus::FailedPermanent),
+        failed_timeout = crate::sql::status::build(BuildStatus::FailedTimeout),
     );
     bounded_dependency_closure_cte_body(
         "kept_failed",
@@ -173,7 +188,7 @@ fn requeue_failed_closure_fresh_sql() -> String {
     format!(
         "{},\n    {}\n{}",
         eval_closure_cte(),
-        kept_failed_cte_body(),
+        kept_failed_cte_body(true),
         requeue_closure_update(SKIP_KEPT, FORGET_STALE_UPSTREAM_MISS),
     )
 }
@@ -190,7 +205,7 @@ pub(super) fn requeue_failed_closure_blocked_sql() -> String {
     format!(
         "{},\n    {}\n{}",
         requeue_ctes("SELECT bj.derivation FROM build_job bj WHERE bj.evaluation = $1"),
-        kept_failed_cte_body(),
+        kept_failed_cte_body(false),
         requeue_closure_update(
             &format!("{SKIP_BLOCKED}{SKIP_KEPT}"),
             FORGET_STALE_UPSTREAM_MISS,
@@ -376,8 +391,10 @@ mod tests {
             "{sql}"
         );
         assert!(
-            !sql.contains("deterministic_blocked") && !sql.contains("build_attempt"),
-            "a reproducible failure is retried once per evaluation: {sql}"
+            !sql.contains("deterministic_blocked")
+                && sql.contains("ba.derivation_build = kf.id")
+                && sql.contains("bj.evaluation = $1"),
+            "old failures can retry, but this evaluation's failed attempts stay failed: {sql}"
         );
     }
 

@@ -27,7 +27,7 @@ use gradient_wire::types::{BuildFailureKind, BuildMetrics, BuildOutput, BuildPro
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel,
-    QueryFilter,
+    QueryFilter, QueryOrder,
 };
 use tracing::{error, info, warn};
 
@@ -813,6 +813,45 @@ async fn build_failed(
         error
     };
 
+    if running_attempt.is_none()
+        && matches!(outcome, FailureOutcome::Permanent | FailureOutcome::Timeout)
+        && !shared_build.status.is_terminal()
+    {
+        let build_job = EBuildJob::find()
+            .filter(CBuildJob::DerivationBuild.eq(derivation_build))
+            .order_by_asc(CBuildJob::CreatedAt)
+            .one(&ctx.worker_db)
+            .await?
+            .map(|job| job.id);
+        let superseded = gradient_db::scheduling::build_attempt::latest_attempt_id(
+            &ctx.worker_db,
+            derivation_build,
+        )
+        .await;
+        let attempt = open_failed_attempt(
+            &ctx.worker_db,
+            build_job,
+            derivation_build,
+            policy::attempt_reason_for(kind, outcome, out_of_memory),
+            policy::truncate_failure_message(error),
+        )
+        .await?;
+        finalize_superseded_log(ctx, superseded).await;
+        let message = if log_banner.trim().is_empty() {
+            error
+        } else {
+            log_banner
+        };
+        if let Err(e) = ctx
+            .storage
+            .log_storage
+            .append(attempt.id, &policy::failure_log_entry(message))
+            .await
+        {
+            warn!(%derivation_build, error = %e, "failed to append worker error to build log");
+        }
+    }
+
     if running_attempt.is_some()
         && let Err(e) = fail_latest_attempt(
             &ctx.worker_db,
@@ -1067,9 +1106,9 @@ async fn open_shortage_attempt(
             .await;
     let attempt = match open_failed_attempt(
         &ctx.worker_db,
-        build_job,
+        Some(build_job),
         derivation_build,
-        AttemptFailureReason::NotEnoughResources,
+        Some(AttemptFailureReason::NotEnoughResources),
         error.to_owned(),
     )
     .await

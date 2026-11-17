@@ -148,9 +148,10 @@ fn kept_failed_cte_body(keep_current_failures: bool) -> String {
     let current_failure = if keep_current_failures {
         format!(
             "EXISTS (SELECT 1 FROM build_attempt ba \
-                     JOIN build_job bj ON bj.id = ba.build_job \
+                     JOIN build_job bj ON bj.derivation_build = ba.derivation_build \
                      WHERE ba.derivation_build = kf.id AND ba.outcome = {} \
-                       AND bj.evaluation = $1)",
+                       AND bj.evaluation = $1 \
+                       AND (ba.build_job = bj.id OR ba.build_finished_at > bj.created_at))",
             crate::sql::status::attempt_outcome(AttemptOutcome::Failed),
         )
     } else {

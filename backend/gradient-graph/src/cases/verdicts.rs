@@ -210,6 +210,118 @@ async fn v03_an_open_stream_gets_no_verdict_even_with_nothing_blocking() {
 }
 
 #[tokio::test]
+async fn shared_failures_stay_failed_when_either_open_stream_completes() {
+    for (kind, failed_status) in [
+        (BuildFailureKind::Permanent, BuildStatus::FailedPermanent),
+        (BuildFailureKind::Timeout, BuildStatus::FailedTimeout),
+    ] {
+        for (owner_first, has_dispatch) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let (e1, e2) = (EvaluationId::now_v7(), EvaluationId::now_v7());
+            let case = Case::start(
+                chain(e1)
+                    .task_option(|task| task.retry_failed_builds = true)
+                    .evaluation(e2)
+                    .task_option(|task| task.retry_failed_builds = true)
+                    .derivation(A)
+                    .entry_point("pkg.a")
+                    .job()
+                    .derivation(B)
+                    .job(),
+            )
+            .await;
+            if has_dispatch {
+                assert!(case.assigned(e1, B, false).await.is_some());
+            }
+            case.build_started(B).await;
+            case.build_failed(B, kind, &[]).await;
+            let history = case.attempts(B).await;
+            assert_eq!(history.len(), 1, "every terminal failure has an attempt");
+            assert_eq!(history[0].outcome, AttemptOutcome::Failed);
+            assert!(history[0].build_finished_at.is_some());
+            case.build_failed(B, kind, &[]).await;
+            assert_eq!(
+                case.attempts(B).await.len(),
+                1,
+                "a repeated failure adds no attempt"
+            );
+            let attempts = case.sb(B).await.attempt;
+            let order = if owner_first { [e1, e2] } else { [e2, e1] };
+            for evaluation in order {
+                stream_completed(&case, evaluation).await;
+                assert_eq!(case.status(B).await, failed_status);
+                assert_eq!(case.sb(B).await.attempt, attempts);
+                assert_eq!(case.status(A).await, BuildStatus::DependencyFailed);
+                assert_eq!(
+                    case.evaluation_status(evaluation).await,
+                    EvaluationStatus::Failed
+                );
+                assert_eq!(case.counters(evaluation).await, [2, 0, 2, 0, 0]);
+                case.zero_drift("shared failure completion").await;
+            }
+            case.finish().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_undispatched_unknown_failure_keeps_its_reason_and_finalizes_both_attempt_logs() {
+    let evaluation = EvaluationId::now_v7();
+    let case = Case::start(
+        shape()
+            .evaluation(evaluation)
+            .task_option(|task| task.retry_failed_builds = true)
+            .derivation(A)
+            .walked()
+            .entry_point("pkg.a")
+            .job()
+            .probed()
+            .drv_cached()
+            .output(A_OUT)
+            .build_status(BuildStatus::Queued)
+            .attempt(AttemptOutcome::Failed, None),
+    )
+    .await;
+    let previous = case.attempts(A).await[0].id;
+    case.ctx
+        .storage
+        .log_storage
+        .append(previous, "previous log")
+        .await
+        .expect("previous inline log");
+    let last_attempt = i32::try_from(case.ctx.config.build.max_attempts.get()).expect("retry cap") - 1;
+    case.override_sb(A, |build| build.attempt = last_attempt).await;
+    case.build_started(A).await;
+    case.build_failed(A, BuildFailureKind::GuestBoot, &[]).await;
+    let attempts = case.attempts(A).await;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].reason, None);
+    let pending = case
+        .db
+        .rows::<gradient_entity::pending_delivery::Entity>()
+        .await;
+    for attempt in &attempts {
+        assert!(pending.iter().any(|delivery| {
+            delivery.kind == gradient_entity::pending_delivery::PendingDeliveryKind::LogFinalize
+                && delivery.key == attempt.id.to_string()
+        }));
+    }
+    stream_completed(&case, evaluation).await;
+    assert_eq!(
+        case.evaluation_status(evaluation).await,
+        EvaluationStatus::Failed
+    );
+    case.transition(Transition::Repair {
+        scope: RepairScope::Unstick(evaluation),
+    })
+    .await;
+    assert_eq!(case.status(A).await, BuildStatus::Queued);
+    case.zero_drift("unknown failure unstick").await;
+    case.finish().await;
+}
+
+#[tokio::test]
 async fn v04_the_last_blocker_writes_the_verdict_and_a_named_aborted_build_turns_it_to_failed() {
     let e1 = EvaluationId::now_v7();
     let case = Case::start(

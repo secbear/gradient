@@ -72,18 +72,18 @@ pub async fn open_attempt<C: ConnectionTrait>(
 
 pub async fn open_failed_attempt<C: ConnectionTrait>(
     db: &C,
-    build_job: BuildJobId,
+    build_job: Option<BuildJobId>,
     derivation_build: DerivationBuildId,
-    reason: AttemptFailureReason,
+    reason: Option<AttemptFailureReason>,
     failure_message: String,
 ) -> Result<Model, DbErr> {
     let now = gradient_types::now();
     Model {
         id: BuildAttemptId::now_v7(),
-        build_job: Some(build_job),
+        build_job,
         derivation_build,
         outcome: AttemptOutcome::Failed,
-        reason: Some(reason),
+        reason,
         failure_message: Some(failure_message),
         build_context: serde_json::json!({}),
         build_finished_at: Some(now),

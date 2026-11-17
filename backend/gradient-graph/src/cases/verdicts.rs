@@ -290,8 +290,10 @@ async fn an_undispatched_unknown_failure_keeps_its_reason_and_finalizes_both_att
         .append(previous, "previous log")
         .await
         .expect("previous inline log");
-    let last_attempt = i32::try_from(case.ctx.config.build.max_attempts.get()).expect("retry cap") - 1;
-    case.override_sb(A, |build| build.attempt = last_attempt).await;
+    let last_attempt =
+        i32::try_from(case.ctx.config.build.max_attempts.get()).expect("retry cap") - 1;
+    case.override_sb(A, |build| build.attempt = last_attempt)
+        .await;
     case.build_started(A).await;
     case.build_failed(A, BuildFailureKind::GuestBoot, &[]).await;
     let attempts = case.attempts(A).await;

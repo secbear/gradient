@@ -466,9 +466,9 @@ pub fn eval_scope_tables() -> &'static [TableSpec] {
         ),
         spec!(
             "derivation_metric",
-            "CREATE TABLE derivation_metric (id TEXT, derivation TEXT, worker_id TEXT, build_time_ms INTEGER, peak_ram_mb INTEGER, oom_killed INTEGER, concurrent_builds INTEGER, cpu_core_score INTEGER, build_cores INTEGER, input_pnames TEXT, created_at TEXT)",
+            "CREATE TABLE derivation_metric (id TEXT, derivation TEXT, worker_id TEXT, build_time_ms INTEGER, peak_ram_mb INTEGER, oom_killed INTEGER, concurrent_builds INTEGER, cpu_core_score INTEGER, build_cores INTEGER, input_pnames TEXT, created_at TEXT, cpu_time_ms INTEGER, avg_cpu_pct REAL, disk_read_bytes INTEGER, disk_write_bytes INTEGER)",
             concat!(
-                "WITH w AS (SELECT created_at AS started, COALESCE(finished_at, (now() AT TIME ZONE 'UTC')) AS ended FROM evaluation WHERE id = $1) SELECT m.id::text, m.derivation::text, m.worker_id::text, m.build_time_ms::text, m.peak_ram_mb::text, m.oom_killed::int::text, m.concurrent_builds::text, m.cpu_core_score::text, m.build_cores::text, array_to_string(m.input_pnames, ','), m.created_at::text FROM derivation_metric m, w WHERE m.derivation IN (",
+                "WITH w AS (SELECT created_at AS started, COALESCE(finished_at, (now() AT TIME ZONE 'UTC')) AS ended FROM evaluation WHERE id = $1) SELECT m.id::text, m.derivation::text, m.worker_id::text, m.build_time_ms::text, m.peak_ram_mb::text, m.oom_killed::int::text, m.concurrent_builds::text, m.cpu_core_score::text, m.build_cores::text, array_to_string(m.input_pnames, ','), m.created_at::text, m.cpu_time_ms::text, m.avg_cpu_pct::text, m.disk_read_bytes::text, m.disk_write_bytes::text FROM derivation_metric m, w WHERE m.derivation IN (",
                 own_derivations!(),
                 ") AND m.created_at BETWEEN w.started AND w.ended"
             ),
@@ -484,7 +484,11 @@ pub fn eval_scope_tables() -> &'static [TableSpec] {
                 "cpu_core_score",
                 "build_cores",
                 "input_pnames",
-                "created_at"
+                "created_at",
+                "cpu_time_ms",
+                "avg_cpu_pct",
+                "disk_read_bytes",
+                "disk_write_bytes"
             ]
         ),
         spec!(

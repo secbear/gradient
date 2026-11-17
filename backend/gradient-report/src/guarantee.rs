@@ -88,6 +88,37 @@ mod tests {
         .expect("log");
     }
 
+    #[test]
+    fn resource_measurements_survive_export_and_missing_values_stay_null() {
+        let conn = rusqlite::Connection::open_in_memory().expect("report");
+        let spec = spec("derivation_metric");
+        create_table(&conn, spec).expect("metric table");
+        let measured = row_with(
+            spec,
+            &[
+                ("cpu_time_ms", "1234"),
+                ("avg_cpu_pct", "42.5"),
+                ("disk_read_bytes", "1048576"),
+                ("disk_write_bytes", "2097152"),
+            ],
+        );
+        write_rows(&conn, spec, &[measured, row_with(spec, &[])]).expect("measurements");
+        let rows: Vec<(Option<i64>, Option<f64>, Option<i64>, Option<i64>)> = conn
+            .prepare("SELECT cpu_time_ms, avg_cpu_pct, disk_read_bytes, disk_write_bytes FROM derivation_metric ORDER BY rowid")
+            .expect("resource query")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("resource values");
+        assert_eq!(
+            rows,
+            vec![
+                (Some(1234), Some(42.5), Some(1048576), Some(2097152)),
+                (None, None, None, None),
+            ]
+        );
+    }
+
     /// `SELECT *` is correct only here. The test must read whatever the file contains, the opposite
     /// of the extractor's rule.
     fn count_occurrences(conn: &rusqlite::Connection, needle: &str) -> usize {

@@ -55,7 +55,7 @@ async fn put_with(
             Ok(etag) => return Ok(etag),
             Err(PutError::Retryable { error, retry_after }) if attempt < backoff.attempts => {
                 let delay = backoff.delay(attempt, retry_after);
-                tracing::warn!(attempt, delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), error = %error, "object PUT failed; retrying");
+                tracing::warn!(attempt, delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), error = %format!("{error:#}"), "object PUT failed; retrying");
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
@@ -89,7 +89,7 @@ async fn try_put(
         request = request.header(CONTENT_TYPE, content_type);
     }
     let resp = request.send().await.map_err(|e| PutError::Retryable {
-        error: anyhow::Error::new(e).context("send the object PUT"),
+        error: anyhow::Error::new(e.without_url()).context("send the object PUT"),
         retry_after: None,
     })?;
 
@@ -103,10 +103,7 @@ async fn try_put(
     }
 
     let retry_after = retry_after(resp.headers());
-    let error = anyhow::anyhow!(
-        "object PUT returned {status}: {}",
-        resp.text().await.unwrap_or_default()
-    );
+    let error = anyhow::anyhow!("object PUT returned {status}");
     Err(
         if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             PutError::Retryable { error, retry_after }
@@ -204,6 +201,22 @@ mod tests {
             err.downcast_ref::<crate::connection::Unresponsive>()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn transport_failures_keep_the_cause_without_presigned_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/object?X-Amz-Signature=private-signature");
+        let error = put_with(&IMMEDIATE, &url, Bytes::from_static(b"nar"), None)
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("send the object PUT"), "{message}");
+        assert!(message.contains("connect"), "{message}");
+        assert!(!message.contains("private-signature"), "{message}");
+        assert!(!message.contains("X-Amz-Signature"), "{message}");
     }
 
     #[test]

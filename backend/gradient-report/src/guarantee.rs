@@ -6,7 +6,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::extract::{create_table, redact_row, write_rows};
+    use gradient_entity::ids::EvaluationId;
+    use gradient_fixtures::{shape::shape, test_date};
+
+    use crate::extract::{create_table, export_tables, redact_row, write_rows};
     use crate::logs::{create_log_table, insert_log};
     use crate::redact::Redactor;
     use crate::schema::{ReportOptions, open_report};
@@ -90,33 +93,55 @@ mod tests {
 
     #[test]
     fn resource_measurements_survive_export_and_missing_values_stay_null() {
-        let conn = rusqlite::Connection::open_in_memory().expect("report");
-        let spec = spec("derivation_metric");
-        create_table(&conn, spec).expect("metric table");
-        let measured = row_with(
-            spec,
-            &[
-                ("cpu_time_ms", "1234"),
-                ("avg_cpu_pct", "42.5"),
-                ("disk_read_bytes", "1048576"),
-                ("disk_write_bytes", "2097152"),
-            ],
-        );
-        write_rows(&conn, spec, &[measured, row_with(spec, &[])]).expect("measurements");
-        let rows: Vec<(Option<i64>, Option<f64>, Option<i64>, Option<i64>)> = conn
-            .prepare("SELECT cpu_time_ms, avg_cpu_pct, disk_read_bytes, disk_write_bytes FROM derivation_metric ORDER BY rowid")
-            .expect("resource query")
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
-            .expect("rows")
-            .collect::<Result<_, _>>()
-            .expect("resource values");
-        assert_eq!(
-            rows,
-            vec![
-                (Some(1234), Some(42.5), Some(1048576), Some(2097152)),
-                (None, None, None, None),
-            ]
-        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let evaluation = EvaluationId::now_v7();
+                let db = shape()
+                    .evaluation(evaluation)
+                    .evaluation_option(|e| {
+                        e.created_at = test_date();
+                        e.finished_at = Some(test_date());
+                    })
+                    .derivation("/nix/store/dddddddddddddddddddddddddddddddd-hello.drv")
+                    .job()
+                    .derivation_metric(|m| {
+                        m.cpu_time_ms = Some(1234);
+                        m.avg_cpu_pct = Some(42.5);
+                        m.disk_read_bytes = Some(1048576);
+                        m.disk_write_bytes = Some(2097152);
+                    })
+                    .derivation_metric(|_| {})
+                    .into_database()
+                    .await;
+                let conn = rusqlite::Connection::open_in_memory().expect("report");
+                export_tables(
+                    &db.connection(),
+                    &conn,
+                    std::slice::from_ref(spec("derivation_metric")),
+                    evaluation.into_inner(),
+                    &Redactor::new(opts(false, false)),
+                )
+                .await
+                .expect("export measurements");
+                let rows: Vec<(Option<i64>, Option<f64>, Option<i64>, Option<i64>)> = conn
+                    .prepare("SELECT cpu_time_ms, avg_cpu_pct, disk_read_bytes, disk_write_bytes FROM derivation_metric ORDER BY cpu_time_ms DESC")
+                    .expect("resource query")
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                    .expect("rows")
+                    .collect::<Result<_, _>>()
+                    .expect("resource values");
+                assert_eq!(
+                    rows,
+                    vec![
+                        (Some(1234), Some(42.5), Some(1048576), Some(2097152)),
+                        (None, None, None, None),
+                    ]
+                );
+                db.finish().await;
+            });
     }
 
     /// `SELECT *` is correct only here. The test must read whatever the file contains, the opposite

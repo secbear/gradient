@@ -3215,6 +3215,7 @@ dependencies = [
  "anyhow",
  "gradient-db",
  "gradient-entity",
+ "gradient-fixtures",
  "gradient-redact",
  "gradient-storage",
  "gradient-types",

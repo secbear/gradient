@@ -77,10 +77,10 @@ pub async fn repair_build_graph(
 
     let adopted = crate::graph::reachability::adopt_pending_closure(db, evaluation).await?;
     report.adopted = adopted.pairs.len();
-    for chunk in adopted.derivations().chunks(crate::IN_CHUNK_SIZE) {
-        let settled = crate::graph::can_start::update_and_settle_need(db, chunk).await?;
-        emit_transition_effects(ctx, &settled.changes).await?;
-    }
+    // This walk binds one UUID array. Splitting its seeds repeats overlapping closure walks.
+    let settled =
+        crate::graph::can_start::update_and_settle_need(db, &adopted.derivations()).await?;
+    emit_transition_effects(ctx, &settled.changes).await?;
     crate::task_board::dep_counts::bump_graph_version(db, &adopted.evaluations()).await?;
 
     report.promoted = crate::graph::can_start::promote_closure(db, evaluation).await?;
@@ -112,7 +112,17 @@ mod tests {
         use std::collections::BTreeMap;
 
         let eval = EvaluationId::now_v7();
-        let d = gradient_types::DerivationId::now_v7();
+        let adopted: Vec<_> = (0..=crate::IN_CHUNK_SIZE)
+            .map(|_| {
+                BTreeMap::from([
+                    ("evaluation".to_owned(), Value::from(eval.into_inner())),
+                    (
+                        "derivation".to_owned(),
+                        Value::from(gradient_types::DerivationId::now_v7().into_inner()),
+                    ),
+                ])
+            })
+            .collect();
         let empty = Vec::<BTreeMap<String, Value>>::new();
         let exec = |rows_affected| MockExecResult {
             last_insert_id: 0,
@@ -124,10 +134,7 @@ mod tests {
             .append_exec_results([exec(0)])
             .append_query_results([empty.clone()])
             .append_exec_results([exec(0)])
-            .append_query_results([vec![BTreeMap::from([
-                ("evaluation".to_owned(), Value::from(eval.into_inner())),
-                ("derivation".to_owned(), Value::from(d.into_inner())),
-            ])]])
+            .append_query_results([adopted])
             .append_exec_results([exec(0), exec(0)])
             .append_query_results([empty.clone()])
             .append_exec_results([exec(1)])
@@ -141,7 +148,7 @@ mod tests {
             .expect("a converging heal succeeds");
         drop(ctx);
 
-        assert_eq!(report.adopted, 1);
+        assert_eq!(report.adopted, crate::IN_CHUNK_SIZE + 1);
         assert!(!report.is_noop(), "an adoption is progress");
         let log = statements(pool.into_transaction_log());
         let adopt = log
@@ -164,6 +171,13 @@ mod tests {
             .iter()
             .position(|s| s.contains("ON d.derivation = r.derivation ORDER BY r.derivation"))
             .expect("the adoption updates what it named");
+        assert_eq!(
+            log.iter()
+                .filter(|s| s.contains("ON d.derivation = r.derivation ORDER BY r.derivation"))
+                .count(),
+            1,
+            "overlapping dependency regions are settled together"
+        );
         assert!(
             adopt < need && need < bump && bump < promote,
             "adopt, update what a name gave a need to, bump, then promote: {log:?}"

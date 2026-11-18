@@ -98,8 +98,7 @@ crate::sql_fn! {
         params = [EvaluationId],
         tier = Walk,
         budget = crate::sql::Budget::walk().buffers(750_000)
-            .because("the same whole-closure walk PROMOTE_CLOSURE_QUERY pays for, plus \
-                      one aggregate scan of the evaluation's outputs and cached paths"),
+            .because("the evaluation closure walk and cached-output completeness aggregate"),
         flags = [Walk],
         status_write = StatusWrite::build(BuildStatus::COMPLETE_CACHED);
 }
@@ -136,13 +135,18 @@ mod tests {
             ),
         );
 
-        assert!(norm(repair_cached_shared_builds_for_eval_sql()).contains(&gate));
+        let sql = norm(repair_cached_shared_builds_for_eval_sql());
+        let (_, update) = sql
+            .split_once("UPDATE derivation_build db")
+            .expect("the cached repair updates shared builds");
+        assert!(update.contains(&gate));
     }
 
     #[tokio::test]
     async fn cached_repair_requires_every_output_and_preserves_scope_and_assignments() {
         use gradient_fixtures::shape::shape;
         use gradient_types::EvaluationId;
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
 
         let (evaluation, other) = (EvaluationId::now_v7(), EvaluationId::now_v7());
         let complete = "00000000000000000000000000000000-complete.drv";
@@ -152,6 +156,8 @@ mod tests {
         let assigned = "44444444444444444444444444444444-assigned.drv";
         let terminal = "55555555555555555555555555555555-terminal.drv";
         let outside = "66666666666666666666666666666666-outside.drv";
+        let unrealized = "77777777777777777777777777777777-unrealized.drv";
+        let metadata = "88888888888888888888888888888888-metadata.drv";
         let db = shape()
             .evaluation(evaluation)
             .derivation(complete)
@@ -160,6 +166,11 @@ mod tests {
             .cached_output(complete)
             .named_output("00000000000000000000000000000002", "dev")
             .cached_path("00000000000000000000000000000002", "complete-dev")
+            .named_output("00000000000000000000000000000003", "doc")
+            .output_option("00000000000000000000000000000003", |output| {
+                output.hash = Some("00000000000000000000000000000001".into());
+                output.package = Some("complete".into());
+            })
             .derivation(partial)
             .job()
             .output("11111111111111111111111111111112")
@@ -181,6 +192,16 @@ mod tests {
             .output("55555555555555555555555555555556")
             .cached_output(terminal)
             .build_status(BuildStatus::Substituted)
+            .derivation(unrealized)
+            .job()
+            .output("77777777777777777777777777777778")
+            .output_option("77777777777777777777777777777778", |output| {
+                output.hash = None;
+            })
+            .derivation(metadata)
+            .job()
+            .output("88888888888888888888888888888889")
+            .cached_output(metadata)
             .evaluation(other)
             .derivation(outside)
             .job()
@@ -188,6 +209,17 @@ mod tests {
             .cached_output(outside)
             .into_database()
             .await;
+
+        let mut metadata_path = db
+            .cached_path("88888888888888888888888888888889")
+            .await
+            .expect("the metadata-only fixture has a cache row")
+            .into_active_model();
+        metadata_path.file_hash = Set(None);
+        metadata_path
+            .update(&db.connection())
+            .await
+            .expect("metadata-only cache row is stored");
 
         let changed = repair_cached_shared_builds_for_eval(&db.connection(), evaluation)
             .await
@@ -201,6 +233,8 @@ mod tests {
             (remote, BuildStatus::Created),
             (assigned, BuildStatus::Created),
             (terminal, BuildStatus::Substituted),
+            (unrealized, BuildStatus::Created),
+            (metadata, BuildStatus::Created),
             (outside, BuildStatus::Created),
         ] {
             assert_eq!(db.shared_build(path).await.status, expected, "{path}");

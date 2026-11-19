@@ -95,6 +95,9 @@ pub struct WorkerConfig {
     /// Set it to `null` to accept every server; avoid that in a production setup.
     pub accepted_server_tokens_file: Option<PathBuf>,
 
+    /// Strict JSON file of required readiness checks; configured checks require server protocol 61.
+    pub health_checks_file: Option<PathBuf>,
+
     /// Seconds without an assigned job after which the worker drains and exits. `null` keeps it
     /// running.
     pub idle_timeout: Option<u64>,
@@ -150,6 +153,7 @@ impl Default for WorkerConfig {
             listen_addr: "127.0.0.1".to_owned(),
             port: 3100,
             accepted_server_tokens_file: None,
+            health_checks_file: None,
             idle_timeout: None,
             max_lifetime: None,
             eval_subprocess: false,

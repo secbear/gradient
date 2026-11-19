@@ -11,6 +11,7 @@ mod error;
 mod exec;
 mod executor;
 mod exit_clock;
+mod health;
 mod listener;
 mod metrics;
 mod nix;
@@ -102,92 +103,118 @@ fn main() -> Result<()> {
 
         let stop = CancellationToken::new();
         install_signal_handler(stop.clone());
-        let (exec, resumed) = start_exec_host(&config, &stop).await?;
-        if let Some(exec) = &exec {
-            install_reload_handler(Arc::clone(&exec.secrets));
-        }
-
-        let kept_logs: Vec<String> = resumed.iter().map(|job| job.stored.job_id.clone()).collect();
-        if let Err(e) = worker::clear_job_logs(&config, &kept_logs) {
-            warn!(error = %e, "could not empty the job log directory");
-        }
-
-        let sessions = TaskTracker::new();
-
-        if config.nar.partial_ttl_secs > 0 {
-            let gc_config = config.clone();
-            let gc_stop = stop.clone();
-            #[expect(clippy::disallowed_methods, reason = "returns once the worker stops")]
-            tokio::spawn(async move {
-                let ttl = std::time::Duration::from_secs(gc_config.nar.partial_ttl_secs);
-                let store = match gradient_storage::PartialStore::new(gc_config.nar_partial_dir()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(error = %e, "NAR partial GC: open failed");
-                        return;
-                    }
-                };
-                let period =
-                    std::time::Duration::from_secs((gc_config.nar.partial_ttl_secs / 4).clamp(60, 3600));
-                let mut tick = tokio::time::interval(period);
-                loop {
-                    tokio::select! {
-                        _ = gc_stop.cancelled() => return,
-                        _ = tick.tick() => {}
-                    }
-                    match store.gc(ttl).await {
-                        Ok(n) if n > 0 => info!(removed = n, "swept stale NAR partials"),
-                        Ok(_) => {}
-                        Err(e) => warn!(error = %e, "NAR partial GC failed"),
-                    }
-                }
-            });
-        }
-
-        if config.discoverable {
-            if config.accepted_server_tokens_file.is_none() {
-                warn!(
-                    "discoverable without --accepted-server-tokens-file; any server reaching the listener is accepted"
-                );
-            }
-            let listener_config = config.clone();
-            let listener_stop = stop.clone();
-            let listener_sessions = sessions.clone();
-            let listener_exec = exec.clone();
-            #[expect(clippy::disallowed_methods, reason = "returns once the worker stops")]
-            tokio::spawn(async move {
-                if let Err(e) = listener::start_listener(
-                    listener_config,
-                    listener_stop,
-                    listener_sessions,
-                    listener_exec,
-                )
-                .await
-                {
-                    error!(error = %e, "listener failed");
-                }
-            });
-        }
-
-        sd_notify::notify(&[sd_notify::NotifyState::Ready])?;
-        let served = match server_url {
-            Some(server_url) => {
-                let worker = Worker::start(config.clone(), exec.clone(), resumed).await?;
-                run_outbound(worker, &server_url, stop, &sessions, config.exit_limits()).await
-            }
-            None => {
-                if let Some(exec) = &exec {
-                    exec.stop_resumed(resumed).await;
-                }
-                serve_incoming_only(&stop, &sessions, config.exit_limits()).await;
-                Ok(())
-            }
-        };
-        if let Some(exec) = &exec {
-            exec.stop_with_worker().await;
-        }
+        let health_stop = stop.child_token();
+        let health_tasks = TaskTracker::new();
+        let health = health::HealthChecks::start(
+            config.health_checks_file.as_deref(),
+            health_stop.clone(),
+            &health_tasks,
+        )?;
+        let served = serve_worker(config, server_url, stop, health).await;
+        health_stop.cancel();
+        health_tasks.close();
+        health_tasks.wait().await;
         served
     })
+}
+
+async fn serve_worker(
+    config: WorkerConfig,
+    server_url: Option<String>,
+    stop: CancellationToken,
+    health: health::HealthChecks,
+) -> Result<()> {
+    let (exec, resumed) = start_exec_host(&config, &stop).await?;
+    if let Some(exec) = &exec {
+        install_reload_handler(Arc::clone(&exec.secrets));
+    }
+
+    let kept_logs: Vec<String> = resumed
+        .iter()
+        .map(|job| job.stored.job_id.clone())
+        .collect();
+    if let Err(e) = worker::clear_job_logs(&config, &kept_logs) {
+        warn!(error = %e, "could not empty the job log directory");
+    }
+
+    let sessions = TaskTracker::new();
+
+    if config.nar.partial_ttl_secs > 0 {
+        let gc_config = config.clone();
+        let gc_stop = stop.clone();
+        #[expect(clippy::disallowed_methods, reason = "returns once the worker stops")]
+        tokio::spawn(async move {
+            let ttl = std::time::Duration::from_secs(gc_config.nar.partial_ttl_secs);
+            let store = match gradient_storage::PartialStore::new(gc_config.nar_partial_dir()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "NAR partial GC: open failed");
+                    return;
+                }
+            };
+            let period = std::time::Duration::from_secs(
+                (gc_config.nar.partial_ttl_secs / 4).clamp(60, 3600),
+            );
+            let mut tick = tokio::time::interval(period);
+            loop {
+                tokio::select! {
+                    _ = gc_stop.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                match store.gc(ttl).await {
+                    Ok(n) if n > 0 => info!(removed = n, "swept stale NAR partials"),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "NAR partial GC failed"),
+                }
+            }
+        });
+    }
+
+    if config.discoverable {
+        if config.accepted_server_tokens_file.is_none() {
+            warn!(
+                "discoverable without --accepted-server-tokens-file; any server reaching the listener is accepted"
+            );
+        }
+        let listener_config = config.clone();
+        let listener_stop = stop.clone();
+        let listener_sessions = sessions.clone();
+        let listener_exec = exec.clone();
+        let listener_health = health.clone();
+        #[expect(clippy::disallowed_methods, reason = "returns once the worker stops")]
+        tokio::spawn(async move {
+            if let Err(e) = listener::start_listener(
+                listener_config,
+                listener_stop,
+                listener_sessions,
+                listener_exec,
+                listener_health,
+            )
+            .await
+            {
+                error!(error = %e, "listener failed");
+            }
+        });
+    }
+
+    sd_notify::notify(&[sd_notify::NotifyState::Ready])?;
+    let served = match server_url {
+        Some(server_url) => {
+            let worker = Worker::start(config.clone(), exec.clone(), resumed, health).await?;
+            run_outbound(worker, &server_url, stop, &sessions, config.exit_limits()).await
+        }
+        None => {
+            if let Some(exec) = &exec {
+                exec.stop_resumed(resumed).await;
+            }
+            serve_incoming_only(&stop, &sessions, config.exit_limits()).await;
+            Ok(())
+        }
+    };
+    if let Some(exec) = &exec {
+        exec.stop_with_worker().await;
+    }
+    served
 }
 
 async fn start_exec_host(

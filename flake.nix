@@ -59,6 +59,8 @@
       evalbench-summarize = import ./nix/tests/bench/evalbench/check.nix { inherit pkgs; };
       evalbench-multinode-report = import ./nix/tests/bench/evalbench-multinode/check.nix { inherit pkgs; };
       reuse = import ./nix/tests/reuse.nix { inherit pkgs; inherit (pkgs) lib; };
+    } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+      worker-readiness-options = import ./nix/tests/worker-readiness-options.nix { inherit pkgs; };
     };
 
     packages = rec {

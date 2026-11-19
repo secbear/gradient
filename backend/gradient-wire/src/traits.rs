@@ -123,6 +123,10 @@ pub trait PeerIdentity: Send + Sync {
 #[async_trait]
 pub trait CapabilitiesProvider: Send + Sync {
     async fn capabilities(&self) -> GradientCapabilities;
+
+    fn readiness_required(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

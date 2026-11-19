@@ -275,14 +275,14 @@ impl Scheduler {
 }
 
 fn can_ever_fetch(worker: &WorkerInfo, fetch: &UnassignedFetch) -> bool {
-    !worker.draining
+    worker.ready_for_jobs()
         && !fetch.excluded.contains(&worker.id)
         && worker
             .authorized_peers
             .as_ref()
             .is_none_or(|peers| peers.contains(&fetch.project))
         && WorkerCaps {
-            capabilities: worker.capabilities.clone(),
+            capabilities: worker.job_capabilities(),
             ..WorkerCaps::default()
         }
         .can_fetch_input(fetch.needs_secrets)

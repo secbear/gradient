@@ -41,6 +41,7 @@
               }
               @case ('connected') {
                 @if (gradientCi().worker; as w) {
+                  <app-worker-health [health]="w.live?.health" [connected]="w.connected" />
                   <a grButton [label]="gradientCiHost" icon="open_in_new" severity="secondary" size="small" class="worker-action-btn"
                     [href]="config.gradientCiUrl" target="_blank" rel="noopener"></a>
                   @if (w.team) {
@@ -103,6 +104,7 @@
               @if (worker.live?.draining) {
                 <gr-badge severity="warning">Draining</gr-badge>
               }
+              <app-worker-health [health]="worker.live?.health" [connected]="worker.connected" />
               <a
                 grButton
                 label="Metrics"

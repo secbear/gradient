@@ -36,6 +36,7 @@ pub struct Registration {
     pub session: Arc<dyn SessionPort>,
     pub active: Vec<crate::jobs::Reattached>,
     pub reclaims_jobs: bool,
+    pub readiness: gradient_pool::WorkerReadiness,
 }
 
 pub struct Registered {
@@ -98,6 +99,12 @@ pub struct Counts {
 )]
 pub enum SchedulerMsg {
     Register(Registration, RpcReplyPort<Registered>),
+    UpdateReadiness {
+        worker: String,
+        session: Arc<dyn SessionPort>,
+        readiness: gradient_pool::WorkerReadiness,
+        reply: RpcReplyPort<Option<bool>>,
+    },
     Unregister {
         worker: String,
         grace: Duration,
@@ -926,6 +933,9 @@ impl SchedulerCore {
             .filter_map(|(worker, kind)| {
                 let (authorized, caps) = self.auth_and_caps(worker);
                 let caps = caps?;
+                if !caps.takes_jobs_of(&kind.job_kind()) {
+                    return None;
+                }
                 Some(crate::cluster::Slot {
                     worker: worker.to_owned(),
                     kind,
@@ -1023,11 +1033,12 @@ impl Actor for CoreActor {
     ) -> Result<(), ActorProcessingErr> {
         match msg {
             SchedulerMsg::Register(reg, reply) => {
-                let last_seen = core.pool.register(
+                let last_seen = core.pool.register_with_readiness(
                     reg.worker.clone(),
                     reg.capabilities,
                     reg.authorized_peers,
                     reg.session,
+                    reg.readiness,
                 );
                 core.restore(&reg.worker, reg.active);
                 core.pool.set_reclaims_jobs(&reg.worker, reg.reclaims_jobs);
@@ -1049,6 +1060,17 @@ impl Actor for CoreActor {
                 reply,
             } => {
                 let _ = reply.send(core.unregister(&worker, grace));
+            }
+            SchedulerMsg::UpdateReadiness {
+                worker,
+                session,
+                readiness,
+                reply,
+            } => {
+                let updated = core
+                    .pool
+                    .update_readiness_from_session(&worker, &session, readiness);
+                let _ = reply.send(updated);
             }
             SchedulerMsg::Reclaim {
                 worker,
@@ -1617,6 +1639,42 @@ mod tests {
         core.pool
             .update_metrics("w1", 0.0, 118_000, None, None, None);
         core
+    }
+
+    #[test]
+    fn unready_connected_workers_are_not_capacity_or_assignment_targets() {
+        let mut core = core_with_a_128_gb_worker();
+        pending_heavy_build(&mut core, 1024);
+        let projects = HashSet::from([ProjectId::now_v7()]);
+        core.idle
+            .record("w1", crate::cluster::SlotKind::Build, Instant::now());
+        assert_eq!(core.cluster_snapshot(Instant::now()).slots.len(), 1);
+        assert_eq!(
+            core.build_capacity_snapshot(&projects, &InstanceContext::default(), false, None, &[],)
+                .unwrap()
+                .workers
+                .len(),
+            1
+        );
+        core.pool
+            .update_readiness("w1", gradient_pool::WorkerReadiness::pending(true));
+        let snapshot = core
+            .build_capacity_snapshot(
+                &projects,
+                &InstanceContext::default(),
+                false,
+                None,
+                &["w1".into()],
+            )
+            .unwrap();
+        assert!(snapshot.connected_workers.contains("w1"));
+        assert!(snapshot.workers.is_empty());
+        assert!(core.cluster_snapshot(Instant::now()).slots.is_empty());
+        assert!(matches!(
+            core.assign("w1", &JobKind::Build, &InstanceContext::default()),
+            AssignOutcome::AtCapacity
+        ));
+        assert!(core.pool.is_connected("w1"));
     }
 
     fn assigned_build(core: &mut SchedulerCore, worker: &str) -> Option<String> {

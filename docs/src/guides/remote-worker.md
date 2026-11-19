@@ -107,6 +107,35 @@ Without this setting, the local worker can still connect on the loopback address
 
     1.  Give the `_gradient-worker` user read access to the file. The `owner = "_gradient-worker"` setting in sops-nix or agenix can assign the owner. The worker can open the file directly. No systemd credentials exist on macOS.
 
+## Required Readiness Checks
+
+Define checks for resources that your worker needs.
+Set `services.gradient.worker.healthChecksFile` to a JSON file.
+Outside the Nix module, use `--health-checks-file` or `GRADIENT_WORKER_HEALTH_CHECKS_FILE`.
+Configured checks require server protocol 61 or newer.
+
+```json
+[
+  {
+    "name": "device-access",
+    "command": ["/run/current-system/sw/bin/test", "-r", "/dev/kvm"],
+    "timeoutSecs": 5,
+    "intervalSecs": 30,
+    "failureThreshold": 1,
+    "successThreshold": 1
+  }
+]
+```
+
+All checks must pass before the worker accepts new jobs.
+A failed check blocks new jobs but does not abort running jobs. New jobs resume after recovery.
+Commands run as the worker user, without an implicit shell. The worker discards their output.
+The four numeric fields above show their defaults.
+Set `intervalSecs` to `null` to retry a startup check until it passes, then stop repeating it.
+Timeouts range from 1 to 300 seconds, intervals from 1 to 3600 seconds, and thresholds from 1 to 100 consecutive results.
+The file accepts up to 32 checks with unique names of 1 to 80 printable ASCII characters. Empty commands and unknown fields are rejected.
+On NixOS, the worker reads the file through a systemd credential. On macOS, give `_gradient-worker` read access to the file.
+
 ## Verify Deployment
 
 - Check **Settings -> Workers**. The worker appears as connected, together with the detected systems and features.

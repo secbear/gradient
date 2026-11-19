@@ -106,18 +106,42 @@ impl Scheduler {
         session: Arc<dyn SessionPort>,
         reclaims_jobs: bool,
     ) -> Result<Registered> {
+        self.register_worker_with_readiness(
+            worker_id,
+            capabilities,
+            authorized_peers,
+            session,
+            reclaims_jobs,
+            false,
+        )
+        .await
+    }
+
+    pub async fn register_worker_with_readiness(
+        &self,
+        worker_id: &str,
+        capabilities: GradientCapabilities,
+        authorized_peers: HashSet<ProjectId>,
+        session: Arc<dyn SessionPort>,
+        reclaims_jobs: bool,
+        readiness_required: bool,
+    ) -> Result<Registered> {
         let caps_json = serde_json::to_value(&capabilities).unwrap_or(serde_json::Value::Null);
         let projects = authorized_peers.iter().copied().collect();
         self.workers.forget(worker_id);
+        self.workers.update(worker_id, |reports| {
+            reports.readiness = Some(gradient_pool::WorkerReadiness::pending(readiness_required));
+        });
         self.pre_warm.forget(worker_id);
         let mut registered = self
-            .reattach_worker(
+            .reattach_worker_with_readiness(
                 worker_id,
                 capabilities,
                 authorized_peers,
                 session,
                 Vec::new(),
                 reclaims_jobs,
+                readiness_required,
             )
             .await?;
         if !reclaims_jobs {
@@ -163,7 +187,52 @@ impl Scheduler {
         active: Vec<crate::jobs::Reattached>,
         reclaims_jobs: bool,
     ) -> Result<Registered> {
+        self.reattach_worker_with_readiness(
+            worker_id,
+            capabilities,
+            authorized_peers,
+            session,
+            active,
+            reclaims_jobs,
+            false,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserves the legacy registration interface"
+    )]
+    pub async fn reattach_worker_with_readiness(
+        &self,
+        worker_id: &str,
+        capabilities: GradientCapabilities,
+        authorized_peers: HashSet<ProjectId>,
+        session: Arc<dyn SessionPort>,
+        active: Vec<crate::jobs::Reattached>,
+        reclaims_jobs: bool,
+        readiness_required: bool,
+    ) -> Result<Registered> {
         let reports = self.workers.reports(worker_id);
+        anyhow::ensure!(
+            !readiness_required
+                || reports
+                    .session
+                    .as_ref()
+                    .is_none_or(|current| Arc::ptr_eq(current, &session)),
+            "worker session has been replaced"
+        );
+        let readiness = reports
+            .readiness
+            .unwrap_or_else(|| gradient_pool::WorkerReadiness::pending(readiness_required));
+        anyhow::ensure!(
+            readiness.is_required() == readiness_required,
+            "worker readiness declaration changed within its session"
+        );
+        self.workers.update(worker_id, |reports| {
+            reports.readiness = Some(readiness.clone());
+            reports.session = Some(Arc::clone(&session));
+        });
         let registration = Registration {
             worker: worker_id.to_owned(),
             capabilities,
@@ -171,6 +240,7 @@ impl Scheduler {
             session,
             active,
             reclaims_jobs,
+            readiness,
         };
         let registered = self
             .call(|reply| SchedulerMsg::Register(registration, reply))
@@ -183,6 +253,46 @@ impl Scheduler {
         }
 
         Ok(registered)
+    }
+
+    pub async fn update_worker_health(
+        &self,
+        worker_id: &str,
+        session: Arc<dyn SessionPort>,
+        health: gradient_wire::types::WorkerHealth,
+    ) -> Result<()> {
+        let (readiness, changed) = self.workers.update(worker_id, |reports| -> Result<_> {
+            anyhow::ensure!(
+                reports
+                    .session
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &session)),
+                "worker session has been replaced"
+            );
+            let readiness = reports
+                .readiness
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("worker has no readiness declaration"))?;
+            let before = readiness.permits_jobs();
+            readiness.update(health)?;
+            Ok((readiness.clone(), before != readiness.permits_jobs()))
+        })?;
+        let worker = worker_id.to_owned();
+        let updated = self
+            .call(|reply| SchedulerMsg::UpdateReadiness {
+                worker,
+                session,
+                readiness,
+                reply,
+            })
+            .await?;
+        // A report may reach a respawned core before its session reattaches.
+        anyhow::ensure!(updated != Some(false), "worker session has been replaced");
+        if changed {
+            self.build_kick.kick();
+            self.refresh_pre_warm().await;
+        }
+        Ok(())
     }
 
     async fn record_worker_connection(&self, worker_id: &str, capabilities: serde_json::Value) {
@@ -203,13 +313,21 @@ impl Scheduler {
         }
     }
 
-    async fn close_worker_connection(&self, worker_id: &str) {
-        let conn = gradient_entity::worker_connection::Entity::find()
+    async fn open_worker_connection(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<gradient_entity::worker_connection::Model>> {
+        gradient_entity::worker_connection::Entity::find()
             .filter(gradient_entity::worker_connection::Column::WorkerId.eq(worker_id))
             .filter(gradient_entity::worker_connection::Column::DisconnectedAt.is_null())
             .order_by_desc(gradient_entity::worker_connection::Column::ConnectedAt)
             .one(&self.db.worker_db)
-            .await;
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn close_worker_connection(&self, worker_id: &str) {
+        let conn = self.open_worker_connection(worker_id).await;
         if let Ok(Some(conn)) = conn {
             let mut am = conn.into_active_model();
             am.disconnected_at = Set(Some(gradient_types::now()));
@@ -351,6 +469,20 @@ impl Scheduler {
             worker_id: worker_id.to_owned(),
         });
         self.build_kick.kick();
+    }
+
+    /// Finish a stopped session's cleanup before admitting its replacement.
+    pub async fn unregister_worker_after_session_exit(&self, worker_id: &str) -> Result<()> {
+        if self.workers.reports(worker_id).session.is_some()
+            || self.open_worker_connection(worker_id).await?.is_some()
+        {
+            self.unregister_worker(worker_id).await;
+            anyhow::ensure!(
+                self.open_worker_connection(worker_id).await?.is_none(),
+                "previous worker connection did not close"
+            );
+        }
+        Ok(())
     }
 
     fn reclaim_grace_of(&self, worker_id: &str) -> Duration {

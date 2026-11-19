@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import { ChangeDetectionStrategy, Component, OnInit, computed, inject, input, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, DestroyRef, OnInit, computed, inject, input, signal } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FormsModule } from '@angular/forms';
 import { TeamsService } from '@core/services/teams.service';
 import { AuthService } from '@core/services/auth.service';
@@ -22,13 +23,13 @@ import {
   WorkerConnection,
   PatchWorkerRequest,
 } from '@core/models';
-import { AllowedCapabilitiesComponent, GradientCiConnectComponent } from '@shared/ui';
+import { AllowedCapabilitiesComponent, GradientCiConnectComponent, WorkerHealthComponent } from '@shared/ui';
 import { ConfirmService } from '@shared/confirm';
 import { MANAGED_ITEM_DISABLED_REASON, canManageTeam } from '@shared/access';
 import { fieldChecks } from '@shared/forms';
 import { checkWorkerUrlWithWebSocketOrHttpScheme } from '@shared/forms/build-worker-url-field-check';
 import { EMPTY, Observable, map, tap } from 'rxjs';
-import { runReloadIntervalWhileTabVisible } from '@shared/paging';
+import { runReloadIntervalWhileTabVisible, workerHealthRefreshDelay } from '@shared/paging';
 import {
   BadgeComponent,
   ButtonComponent,
@@ -61,12 +62,14 @@ const DISPLAY_NAME_REQUIRED = 'Enter a display name.';
     RowComponent,
     RowListComponent,
     SettingsSectionComponent,
+    WorkerHealthComponent,
   ],
   templateUrl: './team-workers.component.html',
   changeDetection: ChangeDetectionStrategy.Eager,
 })
 export class TeamWorkersComponent implements OnInit {
   private teams = inject(TeamsService);
+  private readonly destroyRef = inject(DestroyRef);
   private authService = inject(AuthService);
   private notify = inject(NotifyService);
   private confirm = inject(ConfirmService);
@@ -114,7 +117,8 @@ export class TeamWorkersComponent implements OnInit {
 
   constructor() {
     runReloadIntervalWhileTabVisible(() => this.loading() || this.loadError() !== null ? EMPTY :
-      this.teams.workers(this.teamName).pipe(tap((workers) => this.workers.set(workers))));
+      this.teams.workers(this.teamName).pipe(tap((workers) => this.workers.set(workers))),
+    undefined, () => workerHealthRefreshDelay(this.workers().filter((worker) => worker.connected).map((worker) => worker.live?.health)));
   }
 
   ngOnInit(): void {
@@ -124,7 +128,7 @@ export class TeamWorkersComponent implements OnInit {
   load(): void {
     this.loading.set(true);
     this.loadError.set(null);
-    this.teams.workers(this.teamName).subscribe({
+    this.teams.workers(this.teamName).pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
       next: (workers) => {
         this.workers.set(workers);
         this.loading.set(false);

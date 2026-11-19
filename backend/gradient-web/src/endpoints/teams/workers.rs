@@ -359,6 +359,7 @@ mod tests {
     fn connected(id: &str) -> WorkerInfo {
         WorkerInfo {
             id: id.into(),
+            health: None,
             capabilities: Default::default(),
             architectures: vec!["x86_64-linux".into()],
             system_features: vec!["kvm".into()],

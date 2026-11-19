@@ -51,6 +51,7 @@
                 <gr-badge severity="neutral">Inactive</gr-badge>
               }
               <gr-badge [severity]="worker.connected ? 'success' : 'neutral'">{{ worker.connected ? 'Connected' : 'Offline' }}</gr-badge>
+              <app-worker-health [health]="worker.live?.health" [connected]="worker.connected" />
               @if (worker.gradient_ci) {
                 <a grButton [label]="gradientCiHost" icon="open_in_new" severity="secondary" size="small"
                   [href]="config.gradientCiUrl" target="_blank" rel="noopener"></a>

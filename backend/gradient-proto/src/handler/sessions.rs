@@ -131,6 +131,39 @@ impl Actor for Sessions {
         match msg {
             SessionsMsg::Attach(args, reply) => {
                 let peer_id = args.peer_id.clone();
+                let previous: Vec<_> = st
+                    .live
+                    .iter()
+                    .filter(|(_, (peer, _))| peer == &peer_id)
+                    .map(|(id, (_, actor))| (*id, actor.clone()))
+                    .collect();
+                for (id, actor) in previous {
+                    if let Err(error) = actor
+                        .stop_and_wait(
+                            Some("replaced by new connection".into()),
+                            Some(CALL_TIMEOUT),
+                        )
+                        .await
+                    {
+                        let _ = reply.send(Err(format!(
+                            "previous worker session did not stop: {error}"
+                        )));
+                        return Ok(());
+                    }
+                    // A failed child's post_stop may have skipped scheduler cleanup.
+                    if let Err(error) = st
+                        .scheduler
+                        .unregister_worker_after_session_exit(&peer_id)
+                        .await
+                    {
+                        let _ = reply.send(Err(format!(
+                            "previous worker session cleanup failed: {error}"
+                        )));
+                        return Ok(());
+                    }
+                    // A queued failure event must not unregister the replacement.
+                    st.live.remove(&id);
+                }
                 let result =
                     match Actor::spawn_linked(None, SessionActor, *args, myself.get_cell()).await {
                         Ok((actor, join)) => {
@@ -191,5 +224,252 @@ impl Actor for Sessions {
             .await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use gradient_fixtures::database::TestDatabase;
+    use gradient_pool::session_port::SessionPort;
+    use gradient_test_support::prelude::test_state;
+    use gradient_types::events::Event;
+    use gradient_wire::types::GradientCapabilities;
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::handler::SessionHandles;
+    use crate::handler::session_actor::{SessionRef, tests::connected_pair};
+
+    struct PanicsBeforeUnregister;
+
+    impl Actor for PanicsBeforeUnregister {
+        type Msg = SessionMsg;
+        type State = (Arc<Notify>, Arc<Notify>);
+        type Arguments = Self::State;
+
+        async fn pre_start(
+            &self,
+            _: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(args)
+        }
+
+        async fn post_stop(
+            &self,
+            _: ActorRef<Self::Msg>,
+            st: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            st.0.notify_one();
+            st.1.notified().await;
+            panic!("session failed before scheduler cleanup");
+        }
+    }
+
+    struct SessionsWithFailingChild {
+        failure_handled: Arc<Notify>,
+        cleanup_entered: Arc<Notify>,
+        cleanup_release: Arc<Notify>,
+    }
+
+    impl Actor for SessionsWithFailingChild {
+        type Msg = SessionsMsg;
+        type State = SessionsState;
+        type Arguments = SessionsArgs;
+
+        async fn pre_start(
+            &self,
+            myself: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            let mut st = Sessions.pre_start(myself.clone(), args).await?;
+            let (child, _) = Actor::spawn_linked(
+                None,
+                PanicsBeforeUnregister,
+                (
+                    Arc::clone(&self.cleanup_entered),
+                    Arc::clone(&self.cleanup_release),
+                ),
+                myself.get_cell(),
+            )
+            .await?;
+            let port: Arc<dyn SessionPort> = Arc::new(SessionRef(child.clone()));
+            st.scheduler
+                .register_worker_with_readiness(
+                    "w1",
+                    GradientCapabilities::default(),
+                    HashSet::new(),
+                    port,
+                    false,
+                    true,
+                )
+                .await?;
+            st.live.insert(child.get_id(), ("w1".into(), child));
+            Ok(st)
+        }
+
+        async fn handle(
+            &self,
+            myself: ActorRef<Self::Msg>,
+            msg: Self::Msg,
+            st: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            Sessions.handle(myself, msg, st).await
+        }
+
+        async fn handle_supervisor_evt(
+            &self,
+            myself: ActorRef<Self::Msg>,
+            evt: SupervisionEvent,
+            st: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            let failed = matches!(&evt, SupervisionEvent::ActorFailed(..));
+            Sessions.handle_supervisor_evt(myself, evt, st).await?;
+            if failed {
+                self.failure_handled.notify_one();
+            }
+            Ok(())
+        }
+
+        async fn post_stop(
+            &self,
+            myself: ActorRef<Self::Msg>,
+            st: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            Sessions.post_stop(myself, st).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_child_is_unregistered_before_its_replacement_is_admitted() {
+        for restart_core in [false, true] {
+            let db = TestDatabase::create().await;
+            let state = test_state(db.connection());
+            let scheduler = Arc::new(Scheduler::new(Arc::clone(&state)));
+            let mut core = scheduler.spawn_core(None).await.unwrap();
+            let mut events = state.events.subscribe();
+            let failure_handled = Arc::new(Notify::new());
+            let cleanup_entered = Arc::new(Notify::new());
+            let cleanup_release = Arc::new(Notify::new());
+            let (sessions, sessions_join) = Actor::spawn(
+                None,
+                SessionsWithFailingChild {
+                    failure_handled: Arc::clone(&failure_handled),
+                    cleanup_entered: Arc::clone(&cleanup_entered),
+                    cleanup_release: Arc::clone(&cleanup_release),
+                },
+                SessionsArgs {
+                    scheduler: Arc::clone(&scheduler),
+                    shutdown: state.shutdown.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let (socket, client) = connected_pair().await;
+            let args = SessionArgs {
+                peer_id: "w1".into(),
+                handles: SessionHandles::from_state(&state),
+                scheduler: Arc::clone(&scheduler),
+                socket,
+                capabilities: GradientCapabilities::default(),
+                authorized_peers: HashSet::new(),
+                dialed: None,
+                readiness_required: true,
+            };
+            let attached = {
+                let attach = sessions.call(
+                    |reply| SessionsMsg::Attach(Box::new(args), reply),
+                    Some(CALL_TIMEOUT),
+                );
+                tokio::pin!(attach);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = cleanup_entered.notified() => {},
+                        result = &mut attach => {
+                            panic!("attachment finished before old cleanup: {result:?}");
+                        }
+                    }
+                })
+                .await
+                .expect("Attach waits for the old child's cleanup");
+                if restart_core {
+                    core.stop_and_wait(None, Some(Duration::from_secs(5)))
+                        .await
+                        .unwrap();
+                    core = scheduler.spawn_core(None).await.unwrap();
+                    assert!(scheduler.board_workers().await.is_empty());
+                }
+                cleanup_release.notify_one();
+                attach.await.unwrap()
+            };
+            let CallResult::Success(Ok((replacement, join))) = attached else {
+                panic!("the replacement attaches");
+            };
+            tokio::time::timeout(Duration::from_secs(5), failure_handled.notified())
+                .await
+                .expect("the old child's failure event is handled after replacement");
+            assert!(scheduler.is_worker_connected("w1").await);
+            assert!(!join.is_finished());
+            let workers = scheduler.board_workers().await;
+            assert_eq!(workers.len(), 1);
+            assert!(!workers[0].health.as_ref().unwrap().ready);
+            let connections = db
+                .rows::<gradient_entity::worker_connection::Entity>()
+                .await;
+            assert_eq!(connections.len(), 2);
+            assert_eq!(
+                connections
+                    .iter()
+                    .filter(|connection| connection.disconnected_at.is_none())
+                    .count(),
+                1,
+            );
+            let mut disconnects = 0;
+            while let Ok(envelope) = events.try_recv() {
+                if let Event::WorkerDisconnected(event) = &envelope.event
+                    && event.worker_id == "w1"
+                {
+                    disconnects += 1;
+                }
+            }
+            assert_eq!(disconnects, 1, "old session cleanup emits one disconnect");
+
+            sessions.stop(None);
+            tokio::time::timeout(CALL_TIMEOUT, sessions_join)
+                .await
+                .expect("failed-child supervisor cleanup completes")
+                .unwrap();
+            tokio::time::timeout(CALL_TIMEOUT, join)
+                .await
+                .expect("failed-child replacement cleanup completes")
+                .unwrap();
+            scheduler
+                .unregister_worker_after_session_exit("w1")
+                .await
+                .unwrap();
+            let mut disconnects = 0;
+            while let Ok(envelope) = events.try_recv() {
+                if let Event::WorkerDisconnected(event) = &envelope.event
+                    && event.worker_id == "w1"
+                {
+                    disconnects += 1;
+                }
+            }
+            assert_eq!(disconnects, 1, "normal session cleanup is not repeated");
+            core.stop_and_wait(None, Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .shutdown
+                    .cancel_and_drain(Duration::from_secs(35))
+                    .await
+            );
+            drop((sessions, replacement, core, client, scheduler, state));
+            db.finish().await;
+        }
     }
 }

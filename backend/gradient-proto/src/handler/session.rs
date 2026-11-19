@@ -58,6 +58,7 @@ pub(super) struct Authenticated {
     pub negotiated: GradientCapabilities,
     pub authorized_peers: Vec<String>,
     pub dialed: Option<DialedSession>,
+    pub readiness_required: bool,
 }
 
 pub(super) struct ProtoSession<S> {
@@ -103,6 +104,7 @@ impl ProtoSession<Opening> {
                 negotiated: result.negotiated,
                 authorized_peers: result.authorized_peers,
                 dialed: origin.dialed_session(),
+                readiness_required: result.readiness_required,
             },
         })
     }
@@ -230,6 +232,7 @@ impl ProtoSession<Authenticated> {
                     negotiated,
                     authorized_peers,
                     dialed,
+                    readiness_required,
                 },
         } = self;
 
@@ -252,6 +255,7 @@ impl ProtoSession<Authenticated> {
             capabilities: negotiated,
             authorized_peers,
             dialed,
+            readiness_required,
         };
 
         match sessions.attach(args).await {

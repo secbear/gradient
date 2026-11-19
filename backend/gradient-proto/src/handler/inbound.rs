@@ -223,6 +223,11 @@ impl<'a> InboundContext<'a> {
                 send_error(self.writer, 400, "unexpected InitConnection".into()).await;
                 false
             }
+            ClientMessage::WorkerHealth { .. } => {
+                // Health is connection-scoped and must be handled by the session actor.
+                send_error(self.writer, 400, "unexpected WorkerHealth".into()).await;
+                false
+            }
             ClientMessage::Reject { code, reason } => {
                 info!(peer_id = %self.peer_id, code, %reason, "peer rejected connection");
                 false

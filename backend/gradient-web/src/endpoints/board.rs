@@ -1021,6 +1021,8 @@ async fn load_evaluation_context_for_board_job<C: ConnectionTrait>(
 pub struct BoardWorker {
     pub id: Option<String>,
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<gradient_pool::WorkerHealthInfo>,
     pub projects: Vec<BoardProject>,
     pub draining: bool,
     pub assigned_jobs: i64,
@@ -1082,6 +1084,7 @@ pub async fn get_board_workers(
             BoardWorker {
                 id: accessible.then(|| w.id.clone()),
                 name: accessible.then(|| worker_names.name(&w.id)).flatten(),
+                health: accessible.then_some(w.health).flatten(),
                 projects: projects
                     .unwrap_or_default()
                     .iter()
@@ -1736,6 +1739,7 @@ mod tests {
     ) -> WorkerInfo {
         WorkerInfo {
             id: "w".into(),
+            health: None,
             capabilities: GradientCapabilities {
                 eval,
                 network,

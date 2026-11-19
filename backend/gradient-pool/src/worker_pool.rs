@@ -90,6 +90,23 @@ impl WorkerPool {
         authorized_peers: HashSet<ProjectId>,
         session: Arc<dyn SessionPort>,
     ) -> Arc<AtomicI64> {
+        self.register_with_readiness(
+            id,
+            capabilities,
+            authorized_peers,
+            session,
+            crate::WorkerReadiness::default(),
+        )
+    }
+
+    pub fn register_with_readiness(
+        &mut self,
+        id: String,
+        capabilities: GradientCapabilities,
+        authorized_peers: HashSet<ProjectId>,
+        session: Arc<dyn SessionPort>,
+        readiness: crate::WorkerReadiness,
+    ) -> Arc<AtomicI64> {
         let prior = self.workers.get(&id).map(|slot| {
             (
                 slot.shared().profile(),
@@ -97,6 +114,7 @@ impl WorkerPool {
             )
         });
         let mut worker = TypedWorker::<Active>::new(capabilities, authorized_peers, session);
+        worker.readiness = readiness;
         if let Some((profile, last_seen)) = prior {
             worker.apply_profile(profile);
             last_seen.store(
@@ -179,7 +197,7 @@ impl WorkerPool {
             crate::WorkerCaps {
                 architectures: s.architectures.clone(),
                 system_features: s.system_features.clone(),
-                capabilities: s.capabilities.clone(),
+                capabilities: job_capabilities(&s.capabilities, s.readiness.permits_jobs()),
                 metrics: self.metrics_for(id),
                 zone: s.zone.clone(),
                 endpoint: s.endpoint.clone(),
@@ -292,7 +310,7 @@ impl WorkerPool {
         crate::aggregate(
             self.workers
                 .values()
-                .filter(|slot| !slot.is_draining())
+                .filter(|slot| !slot.is_draining() && slot.shared().readiness.permits_jobs())
                 .map(WorkerSlot::shared),
         )
     }
@@ -326,6 +344,13 @@ impl WorkerPool {
     }
 
     pub fn has_capacity(&self, worker_id: &str, kind: &JobKind) -> bool {
+        if !self
+            .workers
+            .get(worker_id)
+            .is_some_and(|slot| slot.shared().readiness.permits_jobs())
+        {
+            return false;
+        }
         match self.workers.get(worker_id) {
             Some(WorkerSlot::Active(w)) => match kind {
                 JobKind::Flake => true,
@@ -340,7 +365,10 @@ impl WorkerPool {
     pub fn has_idle_eval_only_worker(&self) -> bool {
         self.workers.values().any(|slot| match slot {
             WorkerSlot::Active(w) => {
-                w.capabilities.eval && !w.capabilities.network && w.assigned_jobs.is_empty()
+                w.readiness.permits_jobs()
+                    && w.capabilities.eval
+                    && !w.capabilities.network
+                    && w.assigned_jobs.is_empty()
             }
             WorkerSlot::Draining(_) => false,
         })
@@ -435,7 +463,9 @@ impl WorkerPool {
         let idle = self
             .workers
             .values()
-            .filter(|slot| slot.shared().assigned_jobs.is_empty())
+            .filter(|slot| {
+                slot.shared().readiness.permits_jobs() && slot.shared().assigned_jobs.is_empty()
+            })
             .count()
             .try_into()
             .unwrap_or(u32::MAX);
@@ -471,6 +501,7 @@ impl WorkerPool {
         let s = slot.shared();
         WorkerInfo {
             id: id.to_owned(),
+            health: s.readiness.info(),
             capabilities: s.capabilities.clone(),
             architectures: s.architectures.clone(),
             system_features: s.system_features.clone(),
@@ -507,6 +538,26 @@ impl WorkerPool {
                 .all(|slot| slot.shared().assigned_jobs.capacity() <= assigned_jobs)
     }
 
+    pub fn update_readiness(&mut self, worker: &str, readiness: crate::WorkerReadiness) {
+        if let Some(slot) = self.workers.get_mut(worker) {
+            slot.shared_mut().readiness = readiness;
+        }
+    }
+
+    pub fn update_readiness_from_session(
+        &mut self,
+        worker: &str,
+        session: &Arc<dyn SessionPort>,
+        readiness: crate::WorkerReadiness,
+    ) -> Option<bool> {
+        let slot = self.workers.get_mut(worker)?;
+        if !Arc::ptr_eq(&slot.shared().session, session) {
+            return Some(false);
+        }
+        slot.shared_mut().readiness = readiness;
+        Some(true)
+    }
+
     pub fn stale_worker_ids(&self, now_ms: i64, timeout_ms: i64) -> Vec<String> {
         self.workers
             .iter()
@@ -521,6 +572,8 @@ impl WorkerPool {
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkerInfo {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<crate::WorkerHealthInfo>,
     pub capabilities: GradientCapabilities,
     pub architectures: Vec<String>,
     pub system_features: Vec<String>,
@@ -545,6 +598,31 @@ pub struct WorkerInfo {
     #[serde(serialize_with = "serialize_exec_offer")]
     #[schema(value_type = Option<ExecOffer>)]
     pub exec: Option<ExecInventory>,
+}
+
+impl WorkerInfo {
+    pub fn health_ready(&self) -> bool {
+        self.health.as_ref().is_none_or(|health| health.ready)
+    }
+
+    pub fn ready_for_jobs(&self) -> bool {
+        !self.draining && self.health_ready()
+    }
+
+    pub fn job_capabilities(&self) -> GradientCapabilities {
+        job_capabilities(&self.capabilities, self.health_ready())
+    }
+}
+
+fn job_capabilities(advertised: &GradientCapabilities, ready: bool) -> GradientCapabilities {
+    let mut capabilities = advertised.clone();
+    if !ready {
+        capabilities.build = false;
+        capabilities.eval = false;
+        capabilities.exec = false;
+        capabilities.network = false;
+    }
+    capabilities
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
@@ -644,6 +722,132 @@ mod tests {
         pool.register("w1".into(), caps(), HashSet::new(), port().0);
         assert!(pool.is_connected("w1"));
         assert_eq!(pool.worker_count(), 1);
+    }
+
+    #[test]
+    fn readiness_gates_every_job_kind_without_withdrawing_the_connection() {
+        use gradient_wire::types::{WorkerCheckStatus, WorkerHealth, WorkerHealthCheck};
+
+        let mut pool = WorkerPool::new();
+        let advertised = GradientCapabilities {
+            build: true,
+            eval: true,
+            exec: true,
+            network: true,
+            ..caps()
+        };
+        let (session, mut signals) = port();
+        let mut readiness = crate::WorkerReadiness::pending(true);
+        pool.register_with_readiness(
+            "w1".into(),
+            advertised,
+            HashSet::new(),
+            session,
+            readiness.clone(),
+        );
+        pool.update_capabilities(
+            "w1",
+            WorkerProfile {
+                max_concurrent_builds: 2,
+                exec: Some(ExecInventory::default()),
+                ..Default::default()
+            },
+        );
+        for kind in [JobKind::Build, JobKind::Flake, JobKind::Exec] {
+            assert!(!pool.has_capacity("w1", &kind));
+        }
+        assert!(pool.is_connected("w1"));
+        assert_eq!(pool.worker_counts(), (1, 0));
+        assert!(pool.all_workers()[0].capabilities.build);
+        assert!(!pool.worker_caps("w1").unwrap().capabilities.build);
+
+        for healthy in [true, false, true] {
+            readiness
+                .update(WorkerHealth {
+                    checks: vec![WorkerHealthCheck {
+                        name: "nix-store".into(),
+                        status: if healthy {
+                            WorkerCheckStatus::Passed
+                        } else {
+                            WorkerCheckStatus::Failed
+                        },
+                        healthy,
+                    }],
+                    valid_for_secs: 30,
+                })
+                .unwrap();
+            pool.update_readiness("w1", readiness.clone());
+            for kind in [JobKind::Build, JobKind::Flake, JobKind::Exec] {
+                assert_eq!(pool.has_capacity("w1", &kind), healthy);
+            }
+            assert_eq!(pool.all_workers()[0].health_ready(), healthy);
+            assert_eq!(pool.worker_counts(), (1, u32::from(healthy)));
+            assert_eq!(
+                pool.worker_caps("w1").unwrap().capabilities.network,
+                healthy
+            );
+            assert!(pool.is_connected("w1"));
+        }
+        assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn losing_readiness_keeps_in_flight_jobs_and_permissions() {
+        let mut pool = WorkerPool::new();
+        let (session, mut signals) = port();
+        pool.register("w1".into(), caps(), HashSet::new(), session);
+        pool.assign_job("w1", "build:running", JobKind::Build, 1024);
+        pool.update_readiness("w1", crate::WorkerReadiness::pending(true));
+        let worker = &pool.all_workers()[0];
+        assert_eq!(worker.assigned_job_count, 1);
+        assert!(!worker.health_ready());
+        assert!(pool.gradient_caps_for("w1").is_some());
+        assert!(signals.try_recv().is_err());
+        assert!(pool.release_job("w1", "build:running"));
+    }
+
+    #[test]
+    fn an_old_session_cannot_update_its_replacement_readiness() {
+        use gradient_wire::types::{WorkerCheckStatus, WorkerHealth, WorkerHealthCheck};
+
+        let mut pool = WorkerPool::new();
+        let old = port().0;
+        let current = port().0;
+        let mut healthy = crate::WorkerReadiness::pending(true);
+        healthy
+            .update(WorkerHealth {
+                checks: vec![WorkerHealthCheck {
+                    name: "nix-store".into(),
+                    status: WorkerCheckStatus::Passed,
+                    healthy: true,
+                }],
+                valid_for_secs: 30,
+            })
+            .unwrap();
+        pool.register_with_readiness(
+            "w1".into(),
+            caps(),
+            HashSet::new(),
+            old.clone(),
+            healthy.clone(),
+        );
+        pool.register_with_readiness(
+            "w1".into(),
+            caps(),
+            HashSet::new(),
+            current.clone(),
+            crate::WorkerReadiness::pending(true),
+        );
+        assert_eq!(
+            pool.update_readiness_from_session("w1", &old, healthy.clone()),
+            Some(false)
+        );
+        assert!(!pool.all_workers()[0].health_ready());
+        assert_eq!(
+            pool.update_readiness_from_session("w1", &current, healthy),
+            Some(true)
+        );
+        assert!(pool.all_workers()[0].health_ready());
     }
 
     #[test]

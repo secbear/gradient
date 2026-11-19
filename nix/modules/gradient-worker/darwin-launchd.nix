@@ -54,6 +54,8 @@ in {
         GRADIENT_WORKER_PEERS_FILE = toString cfg.peersFile;
       } // lib.optionalAttrs (cfg.acceptedServerTokensFile != null) {
         GRADIENT_WORKER_ACCEPTED_SERVER_TOKENS_FILE = toString cfg.acceptedServerTokensFile;
+      } // lib.optionalAttrs (cfg.healthChecksFile != null) {
+        GRADIENT_WORKER_HEALTH_CHECKS_FILE = toString cfg.healthChecksFile;
       } // sharedWorkerOptionsModule.environment);
 
       serviceConfig = {

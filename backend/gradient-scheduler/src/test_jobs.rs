@@ -245,6 +245,7 @@ pub(crate) fn exec_caps_labelled(label: &str) -> WorkerCaps {
 pub(crate) fn worker_info(id: &str, caps: WorkerCaps) -> WorkerInfo {
     WorkerInfo {
         id: id.to_owned(),
+        health: None,
         capabilities: caps.capabilities,
         architectures: caps.architectures,
         system_features: caps.system_features,

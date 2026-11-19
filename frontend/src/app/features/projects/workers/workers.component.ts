@@ -4,11 +4,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import { Component, OnInit, computed, inject, signal, viewChild, ChangeDetectionStrategy } from '@angular/core';
+import { Component, DestroyRef, OnInit, computed, inject, signal, viewChild, ChangeDetectionStrategy } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CommonModule } from '@angular/common';
 import { ActivatedRoute, RouterModule } from '@angular/router';
 import { FormsModule } from '@angular/forms';
-import { Observable, finalize, map, tap } from 'rxjs';
+import { EMPTY, Observable, finalize, map, tap } from 'rxjs';
 import { ConfigService } from '@core/services/config.service';
 import { WorkersService } from '@core/services/workers.service';
 import { BreadcrumbsService } from '@core/services/breadcrumbs.service';
@@ -52,14 +53,14 @@ import {
 } from '@gradient/ui/ui';
 import { NotifyService } from '@core/services/notify.service';
 import { apiErrorMessage } from '@core/services/api.service';
-import { AllowedCapabilitiesComponent, GradientCiConnectComponent, LabelHelpComponent, entityKindToIconName } from '@shared/ui';
+import { AllowedCapabilitiesComponent, GradientCiConnectComponent, LabelHelpComponent, WorkerHealthComponent, entityKindToIconName } from '@shared/ui';
 import { MANAGED_ITEM_DISABLED_REASON, WritableDirective, ManagedDisableDirective, ServerConfigurationManagedBannerComponent, requestIfProjectMember } from '@shared/access';
 import { ConfirmService } from '@shared/confirm';
 import { fieldChecks } from '@shared/forms';
 import { checkWorkerUrlWithWebSocketOrHttpScheme } from '@shared/forms/build-worker-url-field-check';
 import { TeamGrantsComponent } from '@features/teams/team-grants/team-grants.component';
 import { links } from '@shared/routing';
-import { runReloadIntervalWhileTabVisible } from '@shared/paging';
+import { runReloadIntervalWhileTabVisible, workerHealthRefreshDelay } from '@shared/paging';
 
 @Component({
   selector: 'app-workers',
@@ -89,6 +90,7 @@ import { runReloadIntervalWhileTabVisible } from '@shared/paging';
     CopyFieldComponent,
     GradientCiConnectComponent,
     TeamGrantsComponent,
+    WorkerHealthComponent,
   ],
   templateUrl: './workers.component.html',
   changeDetection: ChangeDetectionStrategy.Eager,
@@ -98,6 +100,7 @@ export class WorkersComponent implements OnInit {
   protected readonly links = links;
   private route = inject(ActivatedRoute);
   private workersService = inject(WorkersService);
+  private readonly destroyRef = inject(DestroyRef);
   private projectsService = inject(ProjectsService);
   private resolvedProject = injectProject();
   private crumbs = inject(BreadcrumbsService);
@@ -155,9 +158,10 @@ export class WorkersComponent implements OnInit {
 
   workerStatusText(worker: ProjectWorkerEntry): string {
     if (!worker.active) return 'Inactive';
+    if (!worker.connected) return 'Offline';
     const live = worker.live;
     if (live) return `Connected · ${live.assigned_job_count}/${live.max_concurrent_builds} jobs`;
-    return worker.connected ? 'Connected, no jobs for this project (reconnect with the project token)' : 'Offline';
+    return 'Connected, no jobs for this project (reconnect with the project token)';
   }
 
   private menuFor(worker: ProjectWorkerEntry): MenuItem[] {
@@ -220,10 +224,10 @@ export class WorkersComponent implements OnInit {
   }
 
   constructor() {
-    runReloadIntervalWhileTabVisible(() => this.fetchWorkers().pipe(tap((workers) => {
+    runReloadIntervalWhileTabVisible(() => this.loading() ? EMPTY : this.fetchWorkers().pipe(tap((workers) => {
       this.workers.set(workers);
       this.loadError.set(null);
-    })));
+    })), undefined, () => workerHealthRefreshDelay(this.workers().filter((worker) => worker.connected).map((worker) => worker.live?.health)));
   }
 
   private fetchWorkers(): Observable<ProjectWorkerEntry[]> {
@@ -233,7 +237,7 @@ export class WorkersComponent implements OnInit {
   loadWorkers(): void {
     this.loading.set(true);
     this.loadError.set(null);
-    this.fetchWorkers().subscribe({
+    this.fetchWorkers().pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
       next: (workers) => {
         this.workers.set(workers);
         this.loading.set(false);

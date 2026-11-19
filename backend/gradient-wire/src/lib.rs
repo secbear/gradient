@@ -25,6 +25,7 @@ pub mod session;
 pub mod traits;
 pub mod transport;
 pub mod types;
+mod worker_health;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

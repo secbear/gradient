@@ -127,14 +127,14 @@ pub(crate) fn caps_of(worker: &WorkerInfo) -> WorkerCaps {
     WorkerCaps {
         architectures: worker.architectures.clone(),
         system_features: worker.system_features.clone(),
-        capabilities: worker.capabilities.clone(),
+        capabilities: worker.job_capabilities(),
         exec: worker.exec.clone(),
         ..WorkerCaps::default()
     }
 }
 
 pub(crate) fn serves_project(worker: &WorkerInfo, project: ProjectId) -> bool {
-    !worker.draining
+    worker.ready_for_jobs()
         && worker
             .authorized_peers
             .as_ref()

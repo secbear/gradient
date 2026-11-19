@@ -134,6 +134,16 @@
   },
   {
     "group": "",
+    "field": "health_checks_file",
+    "flag": "health-checks-file",
+    "env": "GRADIENT_WORKER_HEALTH_CHECKS_FILE",
+    "type": "Option<PathBuf>",
+    "description": "Strict JSON file of required readiness checks; configured checks require server protocol 61.",
+    "default": null,
+    "values": []
+  },
+  {
+    "group": "",
     "field": "idle_timeout",
     "flag": "idle-timeout",
     "env": "GRADIENT_WORKER_IDLE_TIMEOUT",

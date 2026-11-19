@@ -7,7 +7,9 @@
 use crate::executor::input_fetch::{
     InputDownloader, InputFetchJob, SubprocessDownloader, UpdaterFetchReport, fetch_input,
 };
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -28,6 +30,7 @@ use crate::executor::eval_split::SplitMember;
 use crate::executor::timeline::{JobTimeline, TimelineSnapshot};
 use crate::executor::{AbortSignal, JobExecutor};
 use crate::exit_clock;
+use crate::health::HealthChecks;
 use crate::proto::credentials::CredentialStore;
 use crate::proto::job::JobUpdater;
 use crate::proto::scorer::JobScorer;
@@ -36,7 +39,7 @@ use gradient_worker_client::correlation::AssignmentHandle;
 
 use super::cluster::{ClusterChannels, ClusterHolds, ClusterStart, HeldJob};
 use super::jobs::{Readoption, WorkerJobs, report_when_drained};
-use super::scoring::spawn_scoring_task;
+use super::scoring::{ScoringReadiness, spawn_scoring_task};
 
 const STOP_BUDGET: Duration = Duration::from_secs(5);
 
@@ -57,6 +60,9 @@ pub(super) async fn run_message_loop(
 
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
     heartbeat.tick().await;
+    let mut health_tick = tokio::time::interval(state.health.report_interval());
+    health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut health_updates = state.health.clone();
 
     let mut stop_deadline = None;
 
@@ -65,6 +71,17 @@ pub(super) async fn run_message_loop(
 
     let mut vm_changes = state.vm_changes();
     state.report_live_vms().await;
+
+    if state.health.required() && !stop.is_cancelled() {
+        health_tick.tick().await;
+        let writer = state.writer.clone();
+        state
+            .on_health_tick(move |message| {
+                let writer = writer.clone();
+                async move { writer.send(message).await }
+            })
+            .await?;
+    }
 
     info!("entering dispatch loop");
 
@@ -117,6 +134,22 @@ pub(super) async fn run_message_loop(
 
             _ = heartbeat.tick() => {
                 state.on_heartbeat().await?;
+            }
+
+            _ = health_tick.tick(), if state.health.required() => {
+                let writer = state.writer.clone();
+                state.on_health_tick(move |message| {
+                    let writer = writer.clone();
+                    async move { writer.send(message).await }
+                }).await?;
+            }
+
+            () = health_updates.changed(), if state.health.required() => {
+                let writer = state.writer.clone();
+                state.on_health_tick(move |message| {
+                    let writer = writer.clone();
+                    async move { writer.send(message).await }
+                }).await?;
             }
 
             change = super::vm_report::next_change(&mut vm_changes) => {
@@ -172,6 +205,8 @@ pub(super) struct MessageLoopState {
     fetches: tokio::task::JoinSet<()>,
     running_fetches: Arc<std::sync::atomic::AtomicU32>,
     config: WorkerConfig,
+    health: HealthChecks,
+    health_refresh_pending: Arc<AtomicBool>,
     draining: bool,
     server_draining: bool,
     warm_guests_stopped: bool,
@@ -188,6 +223,7 @@ impl MessageLoopState {
         executor: JobExecutor,
         scorer: JobScorer,
         credentials: CredentialStore,
+        health: HealthChecks,
     ) -> Self {
         let channels = ClusterChannels::new(writer.clone());
         Self {
@@ -206,6 +242,8 @@ impl MessageLoopState {
             running_fetches: Arc::default(),
             executor,
             config,
+            health_refresh_pending: Arc::new(AtomicBool::new(health.required())),
+            health,
             draining: false,
             server_draining: false,
             warm_guests_stopped: false,
@@ -213,6 +251,55 @@ impl MessageLoopState {
             refused: false,
             exiting: false,
         }
+    }
+
+    fn accepting_jobs(&self) -> bool {
+        !self.draining && self.health.ready()
+    }
+
+    async fn request_job(&self, kind: JobKind) -> Result<()> {
+        if self.accepting_jobs() {
+            self.writer.send(ClientMessage::RequestJob { kind }).await?;
+        }
+        Ok(())
+    }
+
+    async fn on_health_tick<F, Fut>(&mut self, send: F) -> Result<()>
+    where
+        F: Fn(ClientMessage) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        let Some(report) = self.health.report() else {
+            return Ok(());
+        };
+        let ready = report.ready();
+        if !ready {
+            self.health_refresh_pending.store(true, Ordering::Release);
+        }
+        send(ClientMessage::WorkerHealth { health: report }).await?;
+        if !self.accepting_jobs() {
+            self.health_refresh_pending.store(true, Ordering::Release);
+            return Ok(());
+        }
+        // Consume before awaiting so a scorer's newer refresh request remains set.
+        if ready && self.health_refresh_pending.swap(false, Ordering::AcqRel) {
+            if let Err(error) = send(ClientMessage::RequestJobList).await {
+                self.health_refresh_pending.store(true, Ordering::Release);
+                return Err(error);
+            }
+            if !self.accepting_jobs() {
+                self.health_refresh_pending.store(true, Ordering::Release);
+                return Ok(());
+            }
+            if let Err(error) = self.on_heartbeat().await {
+                self.health_refresh_pending.store(true, Ordering::Release);
+                return Err(error);
+            }
+            if !self.accepting_jobs() {
+                self.health_refresh_pending.store(true, Ordering::Release);
+            }
+        }
+        Ok(())
     }
 
     fn vm_changes(&self) -> Option<broadcast::Receiver<VmStateChange>> {
@@ -592,10 +679,10 @@ impl MessageLoopState {
         }
 
         self.stop_warm_guests_once_idle();
-        if !self.draining {
+        if self.accepting_jobs() {
             let kind = completed_kind;
             if self.occupied(kind.clone()) < self.max_for(kind.clone()) {
-                self.writer.send(ClientMessage::RequestJob { kind }).await?;
+                self.request_job(kind).await?;
             }
         }
 
@@ -654,7 +741,7 @@ impl MessageLoopState {
         let expired = self.holds.expired(std::time::Instant::now());
         self.report_released(expired, "cluster start timed out")
             .await?;
-        if self.draining {
+        if !self.accepting_jobs() {
             return Ok(());
         }
         let active_eval = self.occupied(JobKind::Flake);
@@ -671,26 +758,17 @@ impl MessageLoopState {
             "heartbeat tick"
         );
         if want_eval {
-            self.writer
-                .send(ClientMessage::RequestJob {
-                    kind: JobKind::Flake,
-                })
+            self.request_job(JobKind::Flake)
                 .await
                 .context("heartbeat RequestJob Flake")?;
         }
         if want_build {
-            self.writer
-                .send(ClientMessage::RequestJob {
-                    kind: JobKind::Build,
-                })
+            self.request_job(JobKind::Build)
                 .await
                 .context("heartbeat RequestJob Build")?;
         }
         if self.occupied(JobKind::Exec) < self.max_for(JobKind::Exec) {
-            self.writer
-                .send(ClientMessage::RequestJob {
-                    kind: JobKind::Exec,
-                })
+            self.request_job(JobKind::Exec)
                 .await
                 .context("heartbeat RequestJob Exec")?;
         }
@@ -700,7 +778,10 @@ impl MessageLoopState {
 
     fn on_job_list_chunk(&mut self, cands: Vec<JobCandidate>, is_final: bool) {
         debug!(count = cands.len(), is_final, "received job list chunk");
-        if self.draining {
+        if !self.accepting_jobs() {
+            if self.health.required() {
+                self.health_refresh_pending.store(true, Ordering::Release);
+            }
             return;
         }
         spawn_scoring_task(
@@ -710,13 +791,23 @@ impl MessageLoopState {
             cands,
             is_final,
             Vec::new(),
+            ScoringReadiness {
+                health: self.health.clone(),
+                refresh_pending: Arc::clone(&self.health_refresh_pending),
+            },
         );
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(candidates = cands.len()))]
     fn on_job_offer(&mut self, cands: Vec<JobCandidate>) {
         debug!(count = cands.len(), "received job offer");
-        if self.draining || cands.is_empty() {
+        if cands.is_empty() {
+            return;
+        }
+        if !self.accepting_jobs() {
+            if self.health.required() {
+                self.health_refresh_pending.store(true, Ordering::Release);
+            }
             return;
         }
         let request_after: Vec<JobKind> = [
@@ -734,6 +825,10 @@ impl MessageLoopState {
             cands,
             true,
             request_after,
+            ScoringReadiness {
+                health: self.health.clone(),
+                refresh_pending: Arc::clone(&self.health_refresh_pending),
+            },
         );
     }
 
@@ -780,6 +875,18 @@ impl MessageLoopState {
                     job_id,
                     accepted: false,
                     reason: Some("worker is draining".to_owned()),
+                    endpoint: None,
+                })
+                .await?;
+            return Ok(());
+        }
+
+        if !self.health.ready() {
+            self.writer
+                .send(ClientMessage::AssignJobResponse {
+                    job_id,
+                    accepted: false,
+                    reason: Some("worker readiness checks have not passed".to_owned()),
                     endpoint: None,
                 })
                 .await?;
@@ -845,7 +952,7 @@ impl MessageLoopState {
                 })
                 .await?;
             if accepted && active_count + 1 < max {
-                self.writer.send(ClientMessage::RequestJob { kind }).await?;
+                self.request_job(kind).await?;
             }
             return Ok(());
         }
@@ -873,7 +980,7 @@ impl MessageLoopState {
         );
 
         if active_count + 1 < max {
-            self.writer.send(ClientMessage::RequestJob { kind }).await?;
+            self.request_job(kind).await?;
         }
 
         Ok(())
@@ -1011,11 +1118,9 @@ impl MessageLoopState {
         self.channels.close(&attempt);
         warn!(%attempt, %reason, held = held.is_some(), running, "cluster attempt aborted by server");
         if let Some(job) = held
-            && !self.draining
+            && self.accepting_jobs()
         {
-            self.writer
-                .send(ClientMessage::RequestJob { kind: job.kind })
-                .await?;
+            self.request_job(job.kind).await?;
         }
 
         Ok(())
@@ -1048,8 +1153,8 @@ impl MessageLoopState {
             let kind = held.kind.clone();
             self.report_released(vec![held], "aborted by server")
                 .await?;
-            if !self.draining {
-                self.writer.send(ClientMessage::RequestJob { kind }).await?;
+            if self.accepting_jobs() {
+                self.request_job(kind).await?;
             }
             return Ok(());
         }
@@ -1271,6 +1376,296 @@ mod tests {
     use crate::executor::failure::JobAborted;
 
     #[tokio::test]
+    async fn recovery_during_a_blocked_health_send_waits_for_the_healthy_report() {
+        let mut session = gradient_worker_client::testing::mock_session().await;
+        let base = tempfile::tempdir().unwrap();
+        let config = WorkerConfig {
+            base_dir: base.path().to_owned(),
+            ..WorkerConfig::default()
+        };
+        let jobs = Arc::new(WorkerJobs::new(&config));
+        let (health, set_ready) = HealthChecks::controlled(false);
+        let observed_health = health.clone();
+        let mut state = MessageLoopState::new(
+            session.writer.clone(),
+            &jobs,
+            config,
+            super::super::test_executor(base.path()),
+            JobScorer::new(),
+            CredentialStore::new(),
+            health,
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sender = session.writer.clone();
+        {
+            let mut tick = Box::pin(state.on_health_tick(|message| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let sender = sender.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    sender.send(message).await
+                }
+            }));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    () = entered.notified() => {}
+                    result = &mut tick => panic!("report completed without release: {result:?}"),
+                }
+                set_ready(true);
+                assert!(observed_health.ready());
+                release.notify_one();
+                tick.await.unwrap();
+            })
+            .await
+            .expect("the blocked report completes after release");
+        }
+        assert!(
+            state.health_refresh_pending.load(Ordering::Acquire),
+            "the unhealthy report cannot finish a refresh"
+        );
+        assert!(matches!(
+            session.server.recv().await.unwrap(),
+            ClientMessage::WorkerHealth { health } if !health.ready()
+        ));
+
+        state
+            .on_health_tick(|message| {
+                let sender = sender.clone();
+                async move { sender.send(message).await }
+            })
+            .await
+            .unwrap();
+        assert!(!state.health_refresh_pending.load(Ordering::Acquire));
+        assert!(
+            matches!(
+                session.server.recv().await.unwrap(),
+                ClientMessage::WorkerHealth { health } if health.ready()
+            ),
+            "the healthy report precedes recovery requests"
+        );
+        assert_eq!(
+            session.server.recv().await.unwrap(),
+            ClientMessage::RequestJobList
+        );
+        session.flush.close();
+    }
+
+    #[tokio::test]
+    async fn pending_refresh_survives_blocked_sends_and_discarded_candidates() {
+        for boundary in [
+            "health_report",
+            "job_list_request",
+            "job_list_chunk",
+            "job_offer",
+            "async_scorer",
+            "concurrent_suppression",
+            "list_send_failure",
+        ] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut session = gradient_worker_client::testing::mock_session().await;
+                let base = tempfile::tempdir().unwrap();
+                let config = WorkerConfig {
+                    base_dir: base.path().to_owned(),
+                    ..WorkerConfig::default()
+                };
+                let jobs = Arc::new(WorkerJobs::new(&config));
+                let (health, set_ready) = HealthChecks::controlled(true);
+                let mut state = MessageLoopState::new(
+                    session.writer.clone(),
+                    &jobs,
+                    config,
+                    super::super::test_executor(base.path()),
+                    JobScorer::new(),
+                    CredentialStore::new(),
+                    health,
+                );
+                let sender = session.writer.clone();
+                let readiness = ScoringReadiness {
+                    health: state.health.clone(),
+                    refresh_pending: Arc::clone(&state.health_refresh_pending),
+                };
+                if boundary == "list_send_failure" {
+                    assert!(state.on_health_tick(|message| {
+                        let sender = sender.clone();
+                        async move {
+                            if matches!(message, ClientMessage::RequestJobList) {
+                                anyhow::bail!("job list send failed");
+                            }
+                            sender.send(message).await
+                        }
+                    }).await.is_err());
+                } else if matches!(boundary, "job_list_chunk" | "job_offer" | "async_scorer") {
+                    state
+                        .on_health_tick(|message| {
+                            let sender = sender.clone();
+                            async move { sender.send(message).await }
+                        })
+                        .await
+                        .unwrap();
+                    assert!(!state.health_refresh_pending.load(Ordering::Acquire));
+                } else {
+                    let entered = Arc::new(tokio::sync::Notify::new());
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let mut tick = Box::pin(state.on_health_tick(|message| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        let sender = sender.clone();
+                        async move {
+                            let block = match &message {
+                                ClientMessage::WorkerHealth { .. } => boundary == "health_report",
+                                ClientMessage::RequestJobList => matches!(
+                                    boundary, "job_list_request" | "concurrent_suppression"
+                                ),
+                                _ => false,
+                            };
+                            if block {
+                                entered.notify_one();
+                                release.notified().await;
+                            }
+                            sender.send(message).await
+                        }
+                    }));
+                    tokio::select! {
+                        () = entered.notified() => {}
+                        result = &mut tick => panic!("send completed without release: {result:?}"),
+                    }
+                    set_ready(false);
+                    if boundary == "concurrent_suppression" {
+                        super::super::scoring::send_score_chunks(
+                            |_| async { Err(anyhow::anyhow!("unhealthy scoring must not send")) },
+                            vec![gradient_wire::messages::CandidateScore {
+                                job_id: "build:offered".into(),
+                                missing_count: 0,
+                                missing_nar_size: 0,
+                                outputs_present: false,
+                            }],
+                            true,
+                            Vec::new(),
+                            &readiness,
+                        )
+                        .await
+                        .unwrap();
+                        set_ready(true);
+                    }
+                    release.notify_one();
+                    tick.await.unwrap();
+                }
+                assert!(matches!(
+                    session.server.recv().await.unwrap(),
+                    ClientMessage::WorkerHealth { health } if health.ready()
+                ));
+                if !matches!(boundary, "health_report" | "list_send_failure") {
+                    assert_eq!(
+                        session.server.recv().await.unwrap(),
+                        ClientMessage::RequestJobList
+                    );
+                }
+                if matches!(boundary, "job_list_chunk" | "job_offer") {
+                    set_ready(false);
+                    let candidates = vec![JobCandidate {
+                        job_id: "build:offered".into(),
+                        ..Default::default()
+                    }];
+                    state
+                        .route(if boundary == "job_offer" {
+                            ServerMessage::JobOffer { candidates }
+                        } else {
+                            ServerMessage::JobListChunk {
+                                candidates,
+                                is_final: true,
+                            }
+                        })
+                        .await
+                        .unwrap();
+                }
+                if boundary == "async_scorer" {
+                    let scores = (0..2_001)
+                        .map(|index| gradient_wire::messages::CandidateScore {
+                            job_id: format!("build:{index}"),
+                            missing_count: 0,
+                            missing_nar_size: 0,
+                            outputs_present: false,
+                        })
+                        .collect();
+                    let entered = Arc::new(tokio::sync::Notify::new());
+                    let permits = Arc::new(tokio::sync::Semaphore::new(0));
+                    let mut scoring = Box::pin(super::super::scoring::send_score_chunks(
+                        |message| {
+                            let entered = Arc::clone(&entered);
+                            let permits = Arc::clone(&permits);
+                            let sender = sender.clone();
+                            async move {
+                                entered.notify_one();
+                                permits.acquire().await.unwrap().forget();
+                                sender.send(message).await
+                            }
+                        },
+                        scores,
+                        true,
+                        Vec::new(),
+                        &readiness,
+                    ));
+                    tokio::select! {
+                        () = entered.notified() => {}
+                        result = &mut scoring => panic!("scoring finished without release: {result:?}"),
+                    }
+                    set_ready(false);
+                    permits.add_permits(8);
+                    scoring.await.unwrap();
+                    session
+                        .server
+                        .recv_until(|message| match message {
+                            ClientMessage::RequestJobChunk { scores, is_final } => {
+                                assert_eq!(scores.len(), 1_000);
+                                assert!(!is_final);
+                                Some(())
+                            }
+                            _ => None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                assert!(
+                    state.health_refresh_pending.load(Ordering::Acquire),
+                    "{boundary} must retain a refresh"
+                );
+                set_ready(true);
+                state
+                    .on_health_tick(|message| {
+                        let sender = sender.clone();
+                        async move { sender.send(message).await }
+                    })
+                    .await
+                    .unwrap();
+                assert!(!state.health_refresh_pending.load(Ordering::Acquire));
+                session
+                    .server
+                    .recv_until(|message| match message {
+                        ClientMessage::WorkerHealth { health } => {
+                            assert!(health.ready());
+                            Some(())
+                        }
+                        _ => None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    session.server.recv().await.unwrap(),
+                    ClientMessage::RequestJobList
+                );
+                session.flush.close();
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("recovery must finish the pending refresh after {boundary}")
+            });
+        }
+    }
+
+    #[tokio::test]
     async fn an_aborted_job_stops_without_reaching_a_checkpoint() {
         let (abort, abort_rx) = AbortSignal::channel();
         abort.send(true).expect("the job listens");
@@ -1363,6 +1758,7 @@ mod tests {
             super::super::test_executor(gcroots.path()),
             JobScorer::new(),
             CredentialStore::new(),
+            HealthChecks::default(),
         );
         state.downloader = Arc::new(OfflineDownloader);
         let _running = state.jobs.register(
@@ -1431,6 +1827,7 @@ mod tests {
             super::super::test_executor(gcroots.path()),
             JobScorer::new(),
             CredentialStore::new(),
+            HealthChecks::default(),
         );
         state.downloader = Arc::new(StalledDownloader);
         let _running = state.jobs.register(

@@ -15179,6 +15179,10 @@ components:
           type:
           - string
           - 'null'
+        health:
+          oneOf:
+          - $ref: '#/components/schemas/WorkerHealthInfo'
+          - type: 'null'
         projects:
           type: array
           items:
@@ -23576,6 +23580,14 @@ components:
       - cache
       - instance
       - team
+    WorkerCheckStatus:
+      type: string
+      enum:
+      - pending
+      - passed
+      - failed
+      - timed_out
+      - error
     WorkerConnection:
       type: object
       required:
@@ -23600,6 +23612,45 @@ components:
           - string
           - 'null'
           format: date-time
+    WorkerHealthCheck:
+      type: object
+      required:
+      - name
+      - status
+      - healthy
+      properties:
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkerCheckStatus'
+          description: Result of the latest attempt.
+        healthy:
+          type: boolean
+          description: Whether the configured success and failure thresholds permit new work.
+    WorkerHealthInfo:
+      type: object
+      required:
+      - ready
+      - checks
+      properties:
+        ready:
+          type: boolean
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkerHealthCheck'
+        observed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the server received the report, not when each check ran.
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the report stops permitting new assignments.
     WorkerInfo:
       type: object
       required:
@@ -23613,6 +23664,10 @@ components:
       properties:
         id:
           type: string
+        health:
+          oneOf:
+          - $ref: '#/components/schemas/WorkerHealthInfo'
+          - type: 'null'
         capabilities:
           $ref: '#/components/schemas/GradientCapabilities'
         architectures:
@@ -23653,6 +23708,10 @@ components:
       - assigned_job_count
       - draining
       properties:
+        health:
+          oneOf:
+          - $ref: '#/components/schemas/WorkerHealthInfo'
+          - type: 'null'
         capabilities:
           $ref: '#/components/schemas/GradientCapabilities'
         architectures:

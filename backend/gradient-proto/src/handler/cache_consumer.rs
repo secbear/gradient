@@ -53,6 +53,7 @@ pub(crate) async fn pull_paths(
     };
 
     let init = ClientMessage::InitConnection {
+        readiness_required: false,
         capabilities: consumer_capabilities(),
         id: uuid::Uuid::now_v7().to_string(),
     };

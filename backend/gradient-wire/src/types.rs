@@ -9,6 +9,9 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 pub use crate::exec::*;
 pub use crate::port_ranges::*;
+pub use crate::worker_health::{
+    WorkerCheckStatus, WorkerHealth, WorkerHealthCheck, WorkerHealthError,
+};
 
 #[derive(
     Proto, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Default, utoipa::ToSchema,

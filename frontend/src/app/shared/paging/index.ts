@@ -6,3 +6,4 @@
 
 export * from './paged-list';
 export * from './refresh';
+export * from './worker-health-refresh';

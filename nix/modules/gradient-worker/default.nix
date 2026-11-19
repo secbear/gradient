@@ -446,6 +446,8 @@ in {
               "gradient_worker_peers:${cfg.peersFile}"
             ] ++ lib.optionals (cfg.acceptedServerTokensFile != null) [
               "gradient_worker_accepted_server_tokens:${cfg.acceptedServerTokensFile}"
+            ] ++ lib.optionals (cfg.healthChecksFile != null) [
+              "gradient_worker_health_checks:${cfg.healthChecksFile}"
             ] ++ lib.optionals (cfg.capabilities.exec && exec.sops.keyFile != null) [
               "gradient_worker_exec_sops_key:${exec.sops.keyFile}"
             ];
@@ -455,6 +457,8 @@ in {
             GRADIENT_WORKER_PEERS_FILE = "%d/gradient_worker_peers";
           } // lib.optionalAttrs (cfg.acceptedServerTokensFile != null) {
             GRADIENT_WORKER_ACCEPTED_SERVER_TOKENS_FILE = "%d/gradient_worker_accepted_server_tokens";
+          } // lib.optionalAttrs (cfg.healthChecksFile != null) {
+            GRADIENT_WORKER_HEALTH_CHECKS_FILE = "%d/gradient_worker_health_checks";
           } // lib.optionalAttrs cfg.capabilities.exec {
             GRADIENT_WORKER_EXEC_IMAGE = "${exec.image}";
             GRADIENT_WORKER_EXEC_DEVICES = builtins.toJSON exec.devices;

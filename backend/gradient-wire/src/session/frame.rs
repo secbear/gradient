@@ -1209,6 +1209,7 @@ mod first_message_tests {
     #[test]
     fn a_worker_greeting_and_a_server_authenticate_are_told_apart() {
         let greeting = ClientMessage::InitConnection {
+            readiness_required: false,
             capabilities: GradientCapabilities::default(),
             id: "w1".into(),
         };
@@ -1331,6 +1332,7 @@ mod agreement_tests {
         let (mut server, mut client) = raw_peer().await;
         let newest = *PROTO_VERSIONS.end();
         let greeting = ClientMessage::InitConnection {
+            readiness_required: false,
             capabilities: crate::messages::GradientCapabilities::default(),
             id: "w".repeat(MAX_HANDSHAKE_MESSAGE_SIZE),
         };

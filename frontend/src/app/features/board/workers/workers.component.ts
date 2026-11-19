@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import { Component, OnInit, inject, signal, computed, ChangeDetectionStrategy } from '@angular/core';
+import { Component, DestroyRef, OnInit, inject, signal, computed, ChangeDetectionStrategy } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
@@ -14,9 +15,11 @@ import { formatMebibytes, formatPercent } from '@shared/text';
 import { metricPointsTo24HourChartSeries } from '../hourly-metric-points-to-24-hour-slots';
 import { oneOf, queryParamSignal } from '@shared/routing';
 import { BadgeComponent, LoadStateComponent, TabSwitchComponent, TableComponent } from '@gradient/ui/ui';
-import { MetricChartComponent, SegmentedBarComponent, ratioSegments } from '@shared/ui';
+import { MetricChartComponent, SegmentedBarComponent, WorkerHealthComponent, ratioSegments } from '@shared/ui';
 import { BoardWorker, BoardFleetPoint, DeviceClass, WorkerLoad, WorkerLoadAverage } from '@core/models';
 import { links } from '@shared/routing';
+import { runReloadIntervalWhileTabVisible, workerHealthRefreshDelay } from '@shared/paging';
+import { EMPTY, tap } from 'rxjs';
 
 type LoadRange = 'now' | '24h' | '7d' | '30d';
 
@@ -29,7 +32,7 @@ const busyPercent = (busy: number, capacity: number) => Math.round((busy / capac
   standalone: true,
   imports: [
     CommonModule, FormsModule, RouterModule, MetricChartComponent, TableComponent, LoadStateComponent, BadgeComponent,
-    SegmentedBarComponent, TabSwitchComponent,
+    SegmentedBarComponent, TabSwitchComponent, WorkerHealthComponent,
   ],
   template: `
     <gr-load-state [loading]="first.loading()" [error]="first.error()" [empty]="!first.received()"
@@ -47,7 +50,12 @@ const busyPercent = (busy: number, capacity: number) => Math.round((busy / capac
                   <a [routerLink]="links.project(p.name)">{{ p.display_name || p.name }}</a>@if (!last) {, }
                 } @empty { - }
               </td>
-              <td>{{ w.draining ? 'draining' : 'active' }}</td>
+              <td>
+                {{ w.draining ? 'draining' : 'active' }}
+                @if (w.health; as health) {
+                  <app-worker-health [health]="health" [connected]="true" />
+                }
+              </td>
               <td>{{ w.assigned_jobs }}/{{ w.max_concurrent_builds }}</td>
               <td class="job-board-table-cell-hidden-on-phone">{{ w.cpu_usage_pct != null ? percent(w.cpu_usage_pct) : '-' }}</td>
               <td class="job-board-table-cell-hidden-on-phone">{{ megabytes(w.ram_free_mb) }}</td>
@@ -137,6 +145,7 @@ const busyPercent = (busy: number, capacity: number) => Math.round((busy / capac
 export class BoardWorkersComponent implements OnInit {
   protected readonly links = links;
   private board = inject(BoardService);
+  private readonly destroyRef = inject(DestroyRef);
   protected first = firstLoad();
   protected readonly failed = requestFailedText;
   workers = signal<BoardWorker[] | null>(null);
@@ -188,6 +197,12 @@ export class BoardWorkersComponent implements OnInit {
   archLoad = computed(() => this.radar(this.rangedLoad()?.by_architecture ?? []));
   featLoad = computed(() => this.radar(this.load()?.by_feature ?? []));
 
+  constructor() {
+    runReloadIntervalWhileTabVisible(() => this.first.loading() || !this.first.received() ? EMPTY :
+      this.board.getWorkers().pipe(tap((workers) => this.workers.set(workers))),
+    undefined, () => workerHealthRefreshDelay((this.workers() ?? []).map((worker) => worker.health)));
+  }
+
   ngOnInit(): void {
     this.loadAll();
   }
@@ -198,7 +213,7 @@ export class BoardWorkersComponent implements OnInit {
   }
 
   private loadAll(): void {
-    this.board.getWorkers().pipe(this.first.track()).subscribe((w) => this.workers.set(w));
+    this.board.getWorkers().pipe(this.first.track(), takeUntilDestroyed(this.destroyRef)).subscribe((w) => this.workers.set(w));
     this.board.getFleet(24).pipe(this.first.track()).subscribe((f) => this.fleet.set(f));
     this.board.getWorkerLoad().pipe(this.first.track()).subscribe((l) => this.load.set(l));
     this.loadAverage();

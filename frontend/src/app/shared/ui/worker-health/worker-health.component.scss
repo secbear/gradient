@@ -1,0 +1,39 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Wavelens GmbH <info@wavelens.io>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+@use '@gradient/ui/styles/variables' as *;
+
+:host {
+  display: inline-flex;
+  align-items: center;
+  gap: $spacing-xs;
+}
+
+.health-report {
+  max-width: min(22rem, calc(100vw - 4rem));
+  max-height: 70vh;
+  overflow-y: auto;
+  font-size: $font-size-sm;
+
+  strong { color: var(--gr-text-primary); }
+  p { margin: $spacing-xs 0; }
+  ul { list-style: none; padding: 0; margin: $spacing-sm 0 0; }
+
+  li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: $spacing-xs $spacing-sm;
+    padding: $spacing-xs 0;
+  }
+}
+
+.check-name {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: break-word;
+  color: var(--gr-text-primary);
+}

@@ -103,6 +103,12 @@ in {
       '';
     };
 
+    healthChecksFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Strict JSON file of required readiness checks; configured checks require server protocol 61.";
+    };
+
     system = {
       architectures = lib.mkOption {
         type = lib.types.listOf lib.types.str;

@@ -11,7 +11,7 @@ use crate::types::{
     BuildFailureKind, BuildMetrics, BuildProgressPhase, CandidateScore, ClusterAddress,
     EvalMessageLevel, EvalProgress, EvalShardSpec, ExecInventory, FinishedShard,
     GradientCapabilities, InputOutcome, JobKind, JobPhaseSpan, JobUpdateKind, QueryMode,
-    RunningAssignment, UploadMetadata, UploadObject, VmStateKind,
+    RunningAssignment, UploadMetadata, UploadObject, VmStateKind, WorkerHealth,
 };
 
 #[derive(Proto, Debug, Clone, PartialEq)]
@@ -20,6 +20,8 @@ pub enum ClientMessage {
     InitConnection {
         capabilities: GradientCapabilities,
         id: String,
+        #[proto(61, default)]
+        readiness_required: bool,
     },
 
     AuthResponse {
@@ -281,6 +283,11 @@ pub enum ClientMessage {
         state: VmStateKind,
         job_id: Option<String>,
     },
+
+    #[proto(61)]
+    WorkerHealth {
+        health: WorkerHealth,
+    },
 }
 
 impl ClientMessage {
@@ -353,6 +360,7 @@ impl ClientMessage {
             ClientMessage::GuestChannelData { .. } => "GuestChannelData",
             ClientMessage::CloseGuestChannel { .. } => "CloseGuestChannel",
             ClientMessage::VmState { .. } => "VmState",
+            ClientMessage::WorkerHealth { .. } => "WorkerHealth",
         }
     }
 

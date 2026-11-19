@@ -365,6 +365,7 @@ async fn after_an_evaluation_build_and_upload_no_original_hash_is_stored() {
     .unwrap();
     let (socket, client) = connected_pair().await;
     let args = SessionArgs {
+        readiness_required: false,
         peer_id: "w1".into(),
         handles: SessionHandles::from_state(&state),
         scheduler: Arc::clone(&scheduler),

@@ -42,6 +42,7 @@ async fn main() {
     };
 
     let init = ClientMessage::InitConnection {
+        readiness_required: false,
         capabilities: GradientCapabilities {
             core: false,
             federate: false,

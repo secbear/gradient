@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 
 use crate::config::WorkerConfig;
 use crate::exec::host::ExecHost;
+use crate::health::HealthChecks;
 use crate::worker::Worker;
 
 pub async fn start_listener(
@@ -24,6 +25,7 @@ pub async fn start_listener(
     stop: CancellationToken,
     sessions: TaskTracker,
     exec: Option<Arc<ExecHost>>,
+    health: HealthChecks,
 ) -> Result<()> {
     let addr = format!("{}:{}", config.listen_addr, config.port);
     let listener = TcpListener::bind(&addr)
@@ -43,8 +45,9 @@ pub async fn start_listener(
                     let config = config.clone();
                     let conn_stop = stop.clone();
                     let exec = exec.clone();
+                    let health = health.clone();
                     sessions.spawn(async move {
-                        if let Err(e) = handle_incoming(stream, config, conn_stop, exec).await {
+                        if let Err(e) = handle_incoming(stream, config, conn_stop, exec, health).await {
                             error!(%addr, error = %e, "incoming connection failed");
                         }
                     });
@@ -73,6 +76,7 @@ async fn handle_incoming(
     config: WorkerConfig,
     stop: CancellationToken,
     exec: Option<Arc<ExecHost>>,
+    health: HealthChecks,
 ) -> Result<()> {
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_PROTO_MESSAGE_SIZE))
@@ -85,7 +89,7 @@ async fn handle_incoming(
     .await
     .context("upgrade the WebSocket")?;
 
-    let worker = Worker::from_accepted(ws, config, exec).await?;
+    let worker = Worker::from_accepted(ws, config, exec, health).await?;
     let executor_handle = worker.executor_handle();
     let (_disconnected, outcome) = worker.run(stop).await;
     executor_handle.shutdown().await;

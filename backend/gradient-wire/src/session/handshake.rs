@@ -7,7 +7,9 @@
 use anyhow::Context;
 
 use crate::error::HandshakeError;
-use crate::messages::{ClientMessage, FailedPeer, GradientCapabilities, ServerMessage};
+use crate::messages::{
+    ClientMessage, FailedPeer, GradientCapabilities, ServerMessage, WORKER_HEALTH_SINCE,
+};
 use crate::rejection::Rejection;
 use crate::session::frame::{ProtoSocket, recv_server_msg, send_client_msg};
 use crate::traits::{
@@ -21,18 +23,21 @@ pub struct Opening;
 pub struct Greeted {
     pub peer_id: String,
     pub client_capabilities: GradientCapabilities,
+    pub readiness_required: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Authenticated {
     pub peer_id: String,
     pub negotiated: GradientCapabilities,
+    pub readiness_required: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Registered {
     pub peer_id: String,
     pub negotiated: GradientCapabilities,
+    pub readiness_required: bool,
 }
 
 impl From<Authenticated> for Registered {
@@ -40,6 +45,7 @@ impl From<Authenticated> for Registered {
         Self {
             peer_id: auth.peer_id,
             negotiated: auth.negotiated,
+            readiness_required: auth.readiness_required,
         }
     }
 }
@@ -52,13 +58,19 @@ pub enum Intent {
 }
 
 pub fn on_init_connection(_: Opening, msg: ClientMessage) -> Result<Greeted, Intent> {
-    let ClientMessage::InitConnection { capabilities, id } = msg else {
+    let ClientMessage::InitConnection {
+        capabilities,
+        id,
+        readiness_required,
+    } = msg
+    else {
         return Err(Intent::Reject(Rejection::ExpectedInitConnection));
     };
 
     Ok(Greeted {
         peer_id: id,
         client_capabilities: capabilities,
+        readiness_required,
     })
 }
 
@@ -75,6 +87,7 @@ pub fn on_auth_response(
     Ok(Authenticated {
         peer_id: greeted.peer_id,
         negotiated,
+        readiness_required: greeted.readiness_required,
     })
 }
 
@@ -85,6 +98,7 @@ pub struct HandshakeResult {
     pub authorized_peers: Vec<String>,
     pub failed_peers: Vec<FailedPeer>,
     pub version: u16,
+    pub readiness_required: bool,
 }
 
 fn agreed_version(socket: &ProtoSocket) -> u16 {
@@ -103,11 +117,14 @@ where
     C: CapabilitiesProvider + ?Sized,
 {
     let caps = capabilities.capabilities().await;
+    let readiness_required = capabilities.readiness_required();
+    require_readiness_protocol(socket, readiness_required).await?;
     send_client_msg(
         socket,
         &ClientMessage::InitConnection {
             capabilities: caps.clone(),
             id: identity.peer_id(),
+            readiness_required,
         },
     )
     .await?;
@@ -143,6 +160,7 @@ where
         authorized_peers,
         failed_peers,
         version: agreed_version(socket),
+        readiness_required,
     })
 }
 
@@ -290,6 +308,7 @@ where
         authorized_peers,
         failed_peers,
         version: agreed_version(socket),
+        readiness_required: registered.readiness_required,
     })
 }
 
@@ -346,6 +365,7 @@ where
         authorized_peers,
         failed_peers,
         version: agreed_version(socket),
+        readiness_required: greeted.readiness_required,
     })
 }
 
@@ -425,11 +445,14 @@ where
     I: PeerIdentity + ?Sized,
     C: CapabilitiesProvider + ?Sized,
 {
+    let readiness_required = capabilities.readiness_required();
+    require_readiness_protocol(socket, readiness_required).await?;
     send_client_msg(
         socket,
         &ClientMessage::InitConnection {
             capabilities: capabilities.capabilities().await,
             id: identity.peer_id(),
+            readiness_required,
         },
     )
     .await?;
@@ -445,6 +468,7 @@ where
             authorized_peers,
             failed_peers,
             version: agreed_version(socket),
+            readiness_required,
         }),
         ServerMessage::Reject { code, reason } => Err(Rejected {
             code,
@@ -454,6 +478,23 @@ where
         .into()),
         other => anyhow::bail!("expected InitAck, got {}", other.variant_name()),
     }
+}
+
+async fn require_readiness_protocol(
+    socket: &mut ProtoSocket,
+    readiness_required: bool,
+) -> anyhow::Result<()> {
+    if readiness_required {
+        let version = socket
+            .agree_version()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("connection closed during version agreement"))?;
+        anyhow::ensure!(
+            version >= WORKER_HEALTH_SINCE,
+            "worker readiness requires protocol {WORKER_HEALTH_SINCE} or newer"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -469,10 +510,12 @@ mod tests {
             ClientMessage::InitConnection {
                 capabilities: GradientCapabilities::default(),
                 id: "peer-1".into(),
+                readiness_required: true,
             },
         );
         let g = result.expect("expected Greeted");
         assert_eq!(g.peer_id, "peer-1");
+        assert!(g.readiness_required);
     }
 
     #[test]
@@ -492,6 +535,7 @@ mod tests {
                 build: true,
                 ..Default::default()
             },
+            readiness_required: true,
         };
         let negotiated = GradientCapabilities {
             build: true,
@@ -507,6 +551,8 @@ mod tests {
         let a = result.expect("expected Authenticated");
         assert_eq!(a.peer_id, "peer-1");
         assert_eq!(a.negotiated, negotiated);
+        assert!(a.readiness_required);
+        assert!(Registered::from(a).readiness_required);
     }
 
     #[test]
@@ -514,6 +560,7 @@ mod tests {
         let greeted = Greeted {
             peer_id: "peer-1".into(),
             client_capabilities: GradientCapabilities::default(),
+            readiness_required: false,
         };
         let result = on_auth_response(
             greeted,

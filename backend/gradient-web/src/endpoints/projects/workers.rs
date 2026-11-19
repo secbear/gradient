@@ -188,6 +188,8 @@ pub(crate) fn patch_edits_managed_fields(body: &PatchWorkerRequest) -> bool {
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct WorkerLiveInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<gradient_pool::WorkerHealthInfo>,
     pub capabilities: GradientCapabilities,
     pub architectures: Vec<String>,
     pub system_features: Vec<String>,
@@ -201,6 +203,7 @@ pub struct WorkerLiveInfo {
 impl From<&WorkerInfo> for WorkerLiveInfo {
     fn from(w: &WorkerInfo) -> Self {
         Self {
+            health: w.health.clone(),
             capabilities: w.capabilities.clone(),
             architectures: w.architectures.clone(),
             system_features: w.system_features.clone(),
@@ -723,6 +726,7 @@ mod tests {
     fn worker(authorized: Option<Vec<ProjectId>>) -> WorkerInfo {
         WorkerInfo {
             id: "w1".into(),
+            health: None,
             capabilities: GradientCapabilities::default(),
             architectures: vec![],
             system_features: vec![],
@@ -739,6 +743,38 @@ mod tests {
             download_speed_mbps: None,
             exec: None,
         }
+    }
+
+    #[test]
+    fn worker_live_health_is_optional_and_reports_admission_separately() {
+        use gradient_wire::types::{WorkerCheckStatus, WorkerHealth, WorkerHealthCheck};
+
+        let mut worker = worker(None);
+        let legacy = serde_json::to_value(WorkerLiveInfo::from(&worker)).unwrap();
+        assert!(legacy.get("health").is_none());
+        worker.health = gradient_pool::WorkerReadiness::pending(true).info();
+        let checking = serde_json::to_value(WorkerLiveInfo::from(&worker)).unwrap();
+        assert_eq!(checking["health"]["ready"], false);
+        assert_eq!(checking["health"]["checks"], serde_json::json!([]));
+        assert!(checking["health"].get("observed_at").is_none());
+        let mut readiness = gradient_pool::WorkerReadiness::pending(true);
+        readiness
+            .update(WorkerHealth {
+                checks: vec![WorkerHealthCheck {
+                    name: "nix-store".into(),
+                    status: WorkerCheckStatus::Passed,
+                    healthy: true,
+                }],
+                valid_for_secs: 30,
+            })
+            .unwrap();
+        worker.health = readiness.info();
+        let passed = serde_json::to_value(WorkerLiveInfo::from(&worker)).unwrap();
+        assert_eq!(passed["health"]["ready"], true);
+        assert_eq!(passed["health"]["checks"][0]["name"], "nix-store");
+        assert_eq!(passed["health"]["checks"][0]["status"], "passed");
+        assert!(passed["health"]["observed_at"].is_string());
+        assert!(passed["health"]["expires_at"].is_string());
     }
 
     #[test]

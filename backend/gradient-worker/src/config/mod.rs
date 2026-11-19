@@ -304,6 +304,16 @@ mod tests {
     }
 
     #[test]
+    fn readiness_checks_are_optional_and_take_a_file_path() {
+        assert!(parse(&[]).unwrap().health_checks_file.is_none());
+        let config = parse(&["--health-checks-file", "/etc/gradient/health.json"]).unwrap();
+        assert_eq!(
+            config.health_checks_file,
+            Some(PathBuf::from("/etc/gradient/health.json"))
+        );
+    }
+
+    #[test]
     fn sops_files_come_from_a_comma_separated_value() {
         let config = parse(&["--exec-sops-files", "/a.yaml,/b.yaml"]).expect("valid paths");
         assert_eq!(

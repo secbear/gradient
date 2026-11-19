@@ -71,16 +71,19 @@ pub struct SessionArgs {
     pub capabilities: GradientCapabilities,
     pub authorized_peers: HashSet<ProjectId>,
     pub dialed: Option<DialedSession>,
+    pub readiness_required: bool,
 }
 
 pub struct SessionState {
     peer_id: String,
     handles: SessionHandles,
     scheduler: Arc<Scheduler>,
+    port: Arc<dyn SessionPort>,
     writer: ProtoWriter,
     capabilities: GradientCapabilities,
     authorized_peers: HashSet<ProjectId>,
     dialed: Option<DialedSession>,
+    readiness_required: bool,
     reclaims_jobs: bool,
     uploads: UploadSession,
     nar_serve_semaphore: Arc<Semaphore>,
@@ -111,6 +114,7 @@ impl Actor for SessionActor {
             capabilities,
             authorized_peers,
             dialed,
+            readiness_required,
         } = args;
         let uploads = open_uploads(
             &handles.upload_admission,
@@ -126,12 +130,13 @@ impl Actor for SessionActor {
                 .version()
                 .is_some_and(|version| version >= RUNNING_JOBS_SINCE);
         let registered = match scheduler
-            .register_worker(
+            .register_worker_with_readiness(
                 &peer_id,
                 capabilities.clone(),
                 authorized_peers.clone(),
-                port,
+                port.clone(),
                 reclaims_jobs,
+                readiness_required,
             )
             .await
         {
@@ -188,10 +193,12 @@ impl Actor for SessionActor {
             peer_id,
             handles,
             scheduler,
+            port,
             writer,
             capabilities,
             authorized_peers,
             dialed,
+            readiness_required,
             reclaims_jobs,
             uploads,
             nar_serve_semaphore: Arc::new(Semaphore::new(max_serves)),
@@ -211,7 +218,36 @@ impl Actor for SessionActor {
     ) -> Result<(), ActorProcessingErr> {
         match msg {
             SessionMsg::Frame(msg, reply) => {
-                let keep = {
+                let keep = if let ClientMessage::WorkerHealth { health } = msg {
+                    if !st.readiness_required {
+                        let _ = send_server_msg(
+                            &st.writer,
+                            &ServerMessage::Error {
+                                code: 400,
+                                message: "unsolicited worker health".into(),
+                            },
+                        )
+                        .await;
+                        false
+                    } else if let Err(error) = st
+                        .scheduler
+                        .update_worker_health(&st.peer_id, st.port.clone(), health)
+                        .await
+                    {
+                        warn!(peer_id = %st.peer_id, %error, "worker health rejected");
+                        let _ = send_server_msg(
+                            &st.writer,
+                            &ServerMessage::Error {
+                                code: 400,
+                                message: "invalid worker health".into(),
+                            },
+                        )
+                        .await;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
                     let mut ctx = InboundContext {
                         writer: &st.writer,
                         handles: &st.handles,
@@ -457,17 +493,17 @@ impl Actor for SessionActor {
                 myself.stop(Some(reason));
             }
             SessionMsg::Reattach => {
-                let port: Arc<dyn SessionPort> = Arc::new(SessionRef(myself.clone()));
                 let active = st.active.pending();
                 if let Err(e) = st
                     .scheduler
-                    .reattach_worker(
+                    .reattach_worker_with_readiness(
                         &st.peer_id,
                         st.capabilities.clone(),
                         st.authorized_peers.clone(),
-                        port,
+                        st.port.clone(),
                         active,
                         st.reclaims_jobs,
+                        st.readiness_required,
                     )
                     .await
                 {
@@ -645,14 +681,16 @@ fn split_uploads(st: &mut SessionState) -> (InboundContext<'_>, &mut UploadSessi
 
 #[cfg(test)]
 pub(in crate::handler) mod tests {
-    use super::super::sessions::{Sessions, SessionsArgs, SessionsMsg};
+    use super::super::sessions::{AttachedSession, Sessions, SessionsArgs, SessionsMsg};
     use super::*;
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
+    use gradient_fixtures::database::TestDatabase;
     use gradient_fixtures::mock::empty_db;
     use gradient_test_support::prelude::*;
     use gradient_wire::PROTO_VERSIONS;
     use gradient_wire::codec::{from_bytes, to_bytes};
+    use gradient_wire::types::{WorkerCheckStatus, WorkerHealth, WorkerHealthCheck};
     use ractor::rpc::CallResult;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Notify;
@@ -775,6 +813,352 @@ pub(in crate::handler) mod tests {
         )
     }
 
+    async fn await_workers(
+        scheduler: &Scheduler,
+        predicate: impl Fn(&[gradient_pool::WorkerInfo]) -> bool,
+    ) -> Vec<gradient_pool::WorkerInfo> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let workers = scheduler.board_workers().await;
+                if predicate(&workers) {
+                    return workers;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the session updates the workers")
+    }
+
+    #[tokio::test]
+    async fn required_sessions_start_not_ready_and_apply_wire_health_reports() {
+        let (socket, mut client) = connected_pair().await;
+        let db = TestDatabase::create().await;
+        let state = test_state(db.connection());
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&state)));
+        let core = scheduler.spawn_core(None).await.unwrap();
+        let (actor, join) = Actor::spawn(
+            None,
+            SessionActor,
+            SessionArgs {
+                peer_id: "w1".into(),
+                handles: SessionHandles::from_state(&state),
+                scheduler: Arc::clone(&scheduler),
+                socket,
+                capabilities: GradientCapabilities::default(),
+                authorized_peers: HashSet::new(),
+                dialed: None,
+                readiness_required: true,
+            },
+        )
+        .await
+        .unwrap();
+        let workers = scheduler.board_workers().await;
+        let initial = workers[0].health.as_ref().expect("required health");
+        assert!(!initial.ready);
+        assert!(initial.checks.is_empty());
+        assert_eq!(initial.observed_at, None);
+        assert_eq!(initial.expires_at, None);
+
+        actor.send_message(SessionMsg::Reattach).unwrap();
+        for (healthy, valid_for_secs, ready) in [
+            (false, 60, false),
+            (true, 60, true),
+            (true, 0, false),
+            (false, 60, false),
+        ] {
+            let health = WorkerHealth {
+                checks: vec![WorkerHealthCheck {
+                    name: "hook".into(),
+                    status: WorkerCheckStatus::Passed,
+                    healthy,
+                }],
+                valid_for_secs,
+            };
+            client
+                .send(Message::Binary(
+                    to_bytes(
+                        &ClientMessage::WorkerHealth {
+                            health: health.clone(),
+                        },
+                        61,
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let workers = await_workers(&scheduler, |workers| {
+                workers
+                    .first()
+                    .and_then(|worker| worker.health.as_ref())
+                    .is_some_and(|observed| {
+                        observed.checks == health.checks && observed.ready == ready
+                    })
+            })
+            .await;
+            let observed = workers[0].health.as_ref().unwrap();
+            assert!(observed.observed_at.is_some());
+            assert!(observed.expires_at.is_some());
+        }
+        actor.stop(None);
+        tokio::time::timeout(gradient_scheduler::actor::CALL_TIMEOUT, join)
+            .await
+            .expect("required session cleanup completes")
+            .unwrap();
+        core.stop_and_wait(None, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(
+            state
+                .shutdown
+                .cancel_and_drain(Duration::from_secs(35))
+                .await
+        );
+        drop((actor, core, client, scheduler, state));
+        db.finish().await;
+    }
+
+    #[tokio::test]
+    async fn health_before_reattach_survives_core_restart_without_renewing_expiry() {
+        let (socket, mut client) = connected_pair().await;
+        let db = TestDatabase::create().await;
+        let state = test_state(db.connection());
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&state)));
+        let core = scheduler.spawn_core(None).await.unwrap();
+        let (actor, join) = Actor::spawn(
+            None,
+            SessionActor,
+            SessionArgs {
+                peer_id: "w1".into(),
+                handles: SessionHandles::from_state(&state),
+                scheduler: Arc::clone(&scheduler),
+                socket,
+                capabilities: GradientCapabilities::default(),
+                authorized_peers: HashSet::new(),
+                dialed: None,
+                readiness_required: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        core.stop_and_wait(None, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let core = scheduler.spawn_core(None).await.unwrap();
+        assert!(scheduler.board_workers().await.is_empty());
+        let health = WorkerHealth {
+            checks: vec![WorkerHealthCheck {
+                name: "hook".into(),
+                status: WorkerCheckStatus::Passed,
+                healthy: true,
+            }],
+            valid_for_secs: 1,
+        };
+        let sent_at = gradient_types::now();
+        for message in [
+            ClientMessage::WorkerHealth {
+                health: health.clone(),
+            },
+            ClientMessage::RequestJobList,
+        ] {
+            client
+                .send(Message::Binary(to_bytes(&message, 61).unwrap()))
+                .await
+                .unwrap();
+        }
+        // The ordered reply proves the health frame was accepted while the new pool was empty.
+        let frame = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .expect("health must not close the session before reattachment")
+            .unwrap()
+            .unwrap();
+        let Message::Binary(bytes) = frame else {
+            panic!("expected a job-list reply, got {frame:?}");
+        };
+        assert_eq!(
+            from_bytes::<ServerMessage>(bytes, 61).unwrap(),
+            ServerMessage::JobListChunk {
+                candidates: vec![],
+                is_final: true
+            },
+        );
+        let accepted_at = gradient_types::now();
+        assert!(!join.is_finished());
+        assert!(scheduler.board_workers().await.is_empty());
+
+        actor.send_message(SessionMsg::Reattach).unwrap();
+        let workers = await_workers(&scheduler, |workers| {
+            workers
+                .first()
+                .and_then(|worker| worker.health.as_ref())
+                .is_some_and(|observed| observed.checks == health.checks && observed.ready)
+        })
+        .await;
+        let original = workers[0].health.as_ref().unwrap();
+        let observed_at = original.observed_at.expect("the report's observation time");
+        let expires_at = original.expires_at.expect("the report's expiry time");
+        assert!(observed_at >= sent_at && observed_at <= accepted_at);
+        assert_eq!(expires_at, observed_at + chrono::Duration::seconds(1));
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        core.stop_and_wait(None, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let core = scheduler.spawn_core(None).await.unwrap();
+        assert!(scheduler.board_workers().await.is_empty());
+        actor.send_message(SessionMsg::Reattach).unwrap();
+        let workers = await_workers(&scheduler, |workers| {
+            workers
+                .first()
+                .and_then(|worker| worker.health.as_ref())
+                .is_some_and(|observed| observed.checks == health.checks && !observed.ready)
+        })
+        .await;
+        let restored = workers[0].health.as_ref().unwrap();
+        assert_eq!(restored.observed_at, Some(observed_at));
+        assert_eq!(restored.expires_at, Some(expires_at));
+        assert!(!join.is_finished());
+
+        actor.stop(None);
+        tokio::time::timeout(gradient_scheduler::actor::CALL_TIMEOUT, join)
+            .await
+            .expect("restarted session cleanup completes")
+            .unwrap();
+        core.stop_and_wait(None, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(
+            state
+                .shutdown
+                .cancel_and_drain(Duration::from_secs(35))
+                .await
+        );
+        drop((actor, core, client, scheduler, state));
+        db.finish().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_unsolicited_or_stale_health_closes_the_session() {
+        for (readiness_required, superseded) in [(false, false), (true, false), (true, true)] {
+            let (socket, mut client) = connected_pair().await;
+            let db = TestDatabase::create().await;
+            let state = test_state(db.connection());
+            let scheduler = Arc::new(Scheduler::new(Arc::clone(&state)));
+            let core = scheduler.spawn_core(None).await.unwrap();
+            let (_actor, join) = Actor::spawn(
+                None,
+                SessionActor,
+                SessionArgs {
+                    peer_id: "w1".into(),
+                    handles: SessionHandles::from_state(&state),
+                    scheduler: Arc::clone(&scheduler),
+                    socket,
+                    capabilities: GradientCapabilities::default(),
+                    authorized_peers: HashSet::new(),
+                    dialed: None,
+                    readiness_required,
+                },
+            )
+            .await
+            .unwrap();
+            let replacement = if superseded {
+                let (socket, client) = connected_pair().await;
+                let (actor, join) = Actor::spawn(
+                    None,
+                    SessionActor,
+                    SessionArgs {
+                        peer_id: "w1".into(),
+                        handles: SessionHandles::from_state(&state),
+                        scheduler: Arc::clone(&scheduler),
+                        socket,
+                        capabilities: GradientCapabilities::default(),
+                        authorized_peers: HashSet::new(),
+                        dialed: None,
+                        readiness_required: true,
+                    },
+                )
+                .await
+                .unwrap();
+                let workers = scheduler.board_workers().await;
+                let health = workers[0].health.as_ref().expect("replacement health");
+                assert!(!health.ready);
+                assert!(health.checks.is_empty());
+                Some((actor, join, client))
+            } else {
+                None
+            };
+            let checks = if readiness_required && !superseded {
+                vec![]
+            } else {
+                vec![WorkerHealthCheck {
+                    name: "hook".into(),
+                    status: WorkerCheckStatus::Passed,
+                    healthy: true,
+                }]
+            };
+            client
+                .send(Message::Binary(
+                    to_bytes(
+                        &ClientMessage::WorkerHealth {
+                            health: WorkerHealth {
+                                checks,
+                                valid_for_secs: 60,
+                            },
+                        },
+                        61,
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), client.next())
+                .await
+                .expect("the report is rejected")
+                .unwrap()
+                .unwrap();
+            let Message::Binary(bytes) = frame else {
+                panic!("expected a rejection, got {frame:?}");
+            };
+            assert_eq!(
+                from_bytes::<ServerMessage>(bytes, 61).unwrap(),
+                ServerMessage::Error {
+                    code: 400,
+                    message: if readiness_required {
+                        "invalid worker health"
+                    } else {
+                        "unsolicited worker health"
+                    }
+                    .into(),
+                },
+            );
+            tokio::time::timeout(Duration::from_secs(5), join)
+                .await
+                .expect("the session closes")
+                .unwrap();
+            if let Some((actor, join, _client)) = replacement {
+                actor.stop(None);
+                tokio::time::timeout(gradient_scheduler::actor::CALL_TIMEOUT, join)
+                    .await
+                    .expect("replacement session cleanup completes after stale health rejection")
+                    .unwrap();
+            } else {
+                assert!(!scheduler.is_worker_connected("w1").await);
+            }
+            core.stop_and_wait(None, Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .shutdown
+                    .cancel_and_drain(Duration::from_secs(35))
+                    .await
+            );
+            drop((_actor, core, client, scheduler, state));
+            db.finish().await;
+        }
+    }
+
     #[tokio::test]
     async fn an_abort_cluster_signal_reaches_the_worker() {
         let (socket, mut client) = connected_pair().await;
@@ -792,6 +1176,7 @@ pub(in crate::handler) mod tests {
                 capabilities: GradientCapabilities::default(),
                 authorized_peers: HashSet::new(),
                 dialed: None,
+                readiness_required: false,
             },
         )
         .await
@@ -838,6 +1223,7 @@ pub(in crate::handler) mod tests {
                 capabilities: GradientCapabilities::default(),
                 authorized_peers: HashSet::new(),
                 dialed: None,
+                readiness_required: false,
             },
         )
         .await
@@ -868,6 +1254,137 @@ pub(in crate::handler) mod tests {
     }
 
     #[tokio::test]
+    async fn replacing_a_same_id_session_waits_for_old_cleanup_before_admission() {
+        for readiness_required in [false, true] {
+            let db = TestDatabase::create().await;
+            let state = test_state(db.connection());
+            let scheduler = Arc::new(Scheduler::new(Arc::clone(&state)));
+            let core = scheduler.spawn_core(None).await.unwrap();
+            let (sessions, sessions_join) = Actor::spawn(
+                None,
+                Sessions,
+                SessionsArgs {
+                    scheduler: Arc::clone(&scheduler),
+                    shutdown: state.shutdown.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut previous: Option<AttachedSession> = None;
+            let mut clients = Vec::new();
+            for generation in 1..=2 {
+                let (socket, client) = connected_pair().await;
+                clients.push(client);
+                let args = SessionArgs {
+                    peer_id: "w1".into(),
+                    handles: SessionHandles::from_state(&state),
+                    scheduler: Arc::clone(&scheduler),
+                    socket,
+                    capabilities: GradientCapabilities::default(),
+                    authorized_peers: HashSet::new(),
+                    dialed: None,
+                    readiness_required,
+                };
+                let CallResult::Success(Ok((actor, join))) = sessions
+                    .call(
+                        |reply| SessionsMsg::Attach(Box::new(args), reply),
+                        Some(gradient_scheduler::actor::CALL_TIMEOUT),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("the session attaches");
+                };
+                if let Some((old, old_join)) = previous.take() {
+                    assert_ne!(old.get_id(), actor.get_id());
+                    tokio::time::timeout(Duration::from_secs(5), old_join)
+                        .await
+                        .expect("old session cleanup completes before replacement admission")
+                        .unwrap();
+                }
+                let workers = scheduler.board_workers().await;
+                assert_eq!(workers.len(), 1);
+                let connections = db
+                    .rows::<gradient_entity::worker_connection::Entity>()
+                    .await;
+                assert_eq!(connections.len(), generation);
+                assert_eq!(
+                    connections
+                        .iter()
+                        .filter(|connection| connection.disconnected_at.is_none())
+                        .count(),
+                    1,
+                );
+                if readiness_required {
+                    let initial = workers[0].health.as_ref().expect("required health");
+                    assert!(!initial.ready);
+                    assert!(initial.checks.is_empty());
+                    assert!(initial.observed_at.is_none());
+                    let result = actor
+                        .call(
+                            |reply| {
+                                SessionMsg::Frame(
+                                    ClientMessage::WorkerHealth {
+                                        health: WorkerHealth {
+                                            checks: vec![WorkerHealthCheck {
+                                                name: "hook".into(),
+                                                status: WorkerCheckStatus::Passed,
+                                                healthy: true,
+                                            }],
+                                            valid_for_secs: 60,
+                                        },
+                                    },
+                                    reply,
+                                )
+                            },
+                            Some(Duration::from_secs(5)),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(result, CallResult::Success(true)));
+                    assert!(
+                        scheduler.board_workers().await[0]
+                            .health
+                            .as_ref()
+                            .unwrap()
+                            .ready
+                    );
+                } else {
+                    assert!(workers[0].health.is_none());
+                }
+                previous = Some((actor, join));
+            }
+            sessions.stop(None);
+            tokio::time::timeout(gradient_scheduler::actor::CALL_TIMEOUT, sessions_join)
+                .await
+                .expect("handoff supervisor cleanup completes")
+                .unwrap();
+            tokio::time::timeout(gradient_scheduler::actor::CALL_TIMEOUT, previous.unwrap().1)
+                .await
+                .expect("final handoff session cleanup completes")
+                .unwrap();
+            assert!(!scheduler.is_worker_connected("w1").await);
+            assert!(
+                db.rows::<gradient_entity::worker_connection::Entity>()
+                    .await
+                    .iter()
+                    .all(|connection| connection.disconnected_at.is_some())
+            );
+            core.stop_and_wait(None, Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .shutdown
+                    .cancel_and_drain(Duration::from_secs(35))
+                    .await
+            );
+            drop((sessions, core, clients, scheduler, state));
+            db.finish().await;
+        }
+    }
+
+    #[tokio::test]
     async fn stopping_the_sessions_closes_every_socket_without_a_draining_frame() {
         let (socket, mut client) = connected_pair().await;
         let state = test_state(empty_db());
@@ -891,6 +1408,7 @@ pub(in crate::handler) mod tests {
             capabilities: GradientCapabilities::default(),
             authorized_peers: HashSet::new(),
             dialed: None,
+            readiness_required: false,
         };
         let CallResult::Success(Ok((_session, session_join))) = sessions
             .call(|reply| SessionsMsg::Attach(Box::new(args), reply), None)

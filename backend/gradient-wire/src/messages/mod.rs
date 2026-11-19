@@ -27,6 +27,7 @@ pub use crate::types::{
     DeviceClass, DeviceRequest, DeviceRequestError, ExecAllow, ExecDefaults, ExecInventory,
     ExecJob, ExecLimits, ExecRequirement, ExecSpec, JobContext, Phase, SopsFile, exec_image_attr,
 };
+pub use crate::types::{WorkerCheckStatus, WorkerHealth, WorkerHealthCheck, WorkerHealthError};
 pub use client::ClientMessage;
 pub use server::{FailedPeer, ServerMessage};
 
@@ -51,6 +52,8 @@ pub const HELD_EVAL_SHARDS_SINCE: u16 = 55;
 pub const FLAKE_INPUT_SOURCES_SINCE: u16 = 56;
 
 pub const GUEST_CHANNEL_OUTPUT_FLOW_CONTROL_SINCE: u16 = 60;
+
+pub const WORKER_HEALTH_SINCE: u16 = 61;
 
 pub const GUEST_CHANNEL_CHUNK: usize = 32 * 1024;
 

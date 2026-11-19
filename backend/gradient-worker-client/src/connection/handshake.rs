@@ -62,12 +62,19 @@ impl PeerIdentity for WorkerIdentity {
     }
 }
 
-struct StaticCapabilities(GradientCapabilities);
+struct StaticCapabilities {
+    capabilities: GradientCapabilities,
+    readiness_required: bool,
+}
 
 #[async_trait]
 impl CapabilitiesProvider for StaticCapabilities {
     async fn capabilities(&self) -> GradientCapabilities {
-        self.0.clone()
+        self.capabilities.clone()
+    }
+
+    fn readiness_required(&self) -> bool {
+        self.readiness_required
     }
 }
 
@@ -77,11 +84,24 @@ pub async fn perform_handshake(
     peer_tokens: Vec<(String, String)>,
     capabilities: GradientCapabilities,
 ) -> Result<HandshakeResult> {
+    perform_handshake_with_readiness(conn, peer_id, peer_tokens, capabilities, false).await
+}
+
+pub async fn perform_handshake_with_readiness(
+    conn: &mut ProtoConnection,
+    peer_id: String,
+    peer_tokens: Vec<(String, String)>,
+    capabilities: GradientCapabilities,
+    readiness_required: bool,
+) -> Result<HandshakeResult> {
     let identity = WorkerIdentity {
         peer_id,
         peer_tokens,
     };
-    let capabilities = StaticCapabilities(capabilities);
+    let capabilities = StaticCapabilities {
+        capabilities,
+        readiness_required,
+    };
     let result = answered_in_time(as_peer(conn.socket_mut(), &identity, &capabilities)).await?;
     info!(
         version = result.version,
@@ -125,11 +145,31 @@ pub async fn perform_dialed_handshake(
     accepted_server_tokens: Option<Vec<(String, String)>>,
     capabilities: GradientCapabilities,
 ) -> Result<HandshakeResult> {
+    perform_dialed_handshake_with_readiness(
+        conn,
+        peer_id,
+        accepted_server_tokens,
+        capabilities,
+        false,
+    )
+    .await
+}
+
+pub async fn perform_dialed_handshake_with_readiness(
+    conn: &mut ProtoConnection,
+    peer_id: String,
+    accepted_server_tokens: Option<Vec<(String, String)>>,
+    capabilities: GradientCapabilities,
+    readiness_required: bool,
+) -> Result<HandshakeResult> {
     let identity = WorkerIdentity {
         peer_id,
         peer_tokens: Vec::new(),
     };
-    let capabilities = StaticCapabilities(capabilities);
+    let capabilities = StaticCapabilities {
+        capabilities,
+        readiness_required,
+    };
     let verifier = AcceptedServers(accepted_server_tokens.map(Arc::new));
     let result = answered_in_time(as_dialed(
         conn.socket_mut(),
@@ -229,8 +269,141 @@ mod tests {
         assert_eq!(result.version, *gradient_wire::PROTO_VERSIONS.end());
         assert!(result.negotiated.eval);
         assert!(result.negotiated.build);
+        assert!(!result.readiness_required);
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_is_advertised_and_returned_in_both_handshake_directions() {
+        use gradient_wire::session::handshake::{DialerCredentials, as_authority, as_dialer};
+        use gradient_wire::traits::{AuthOutcome, DialerAuthority, PeerAuthority};
+
+        struct Authority;
+
+        #[async_trait]
+        impl PeerAuthority for Authority {
+            type Challenge = ();
+
+            async fn challenge(&self, _: &str) -> Result<((), Vec<String>)> {
+                Ok(((), vec![]))
+            }
+
+            async fn authorize(
+                &self,
+                _: &str,
+                _: (),
+                _: &[(String, String)],
+            ) -> Result<AuthOutcome> {
+                Ok(AuthOutcome::Accept {
+                    authorized_peers: vec![],
+                    failed_peers: vec![],
+                })
+            }
+
+            async fn negotiate(
+                &self,
+                _: &str,
+                client: GradientCapabilities,
+            ) -> Result<GradientCapabilities> {
+                Ok(client)
+            }
+        }
+
+        #[async_trait]
+        impl DialerAuthority for Authority {
+            async fn admit(&self, _: &str) -> Result<AuthOutcome> {
+                Ok(AuthOutcome::Accept {
+                    authorized_peers: vec![],
+                    failed_peers: vec![],
+                })
+            }
+
+            async fn negotiate(
+                &self,
+                _: &str,
+                client: GradientCapabilities,
+            ) -> Result<GradientCapabilities> {
+                Ok(client)
+            }
+        }
+
+        for required in [false, true] {
+            let (mut server, peer) = gradient_wire::testing::loopback().await;
+            let mut conn = ProtoConnection { socket: peer };
+            let (server, worker) = tokio::join!(
+                as_authority(&mut server, &Authority),
+                perform_handshake_with_readiness(
+                    &mut conn,
+                    "w1".into(),
+                    vec![],
+                    all_caps(),
+                    required
+                ),
+            );
+            assert_eq!(server.unwrap().readiness_required, required);
+            assert_eq!(worker.unwrap().readiness_required, required);
+
+            let (peer, mut server) = gradient_wire::testing::loopback().await;
+            let mut conn = ProtoConnection { socket: peer };
+            let credentials = DialerCredentials {
+                worker_id: "w1".into(),
+                tokens: vec![],
+            };
+            let (server, worker) = tokio::join!(
+                as_dialer(&mut server, &credentials, &Authority),
+                perform_dialed_handshake_with_readiness(
+                    &mut conn,
+                    "w1".into(),
+                    None,
+                    all_caps(),
+                    required
+                ),
+            );
+            assert_eq!(server.unwrap().readiness_required, required);
+            assert_eq!(worker.unwrap().readiness_required, required);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_readiness_refuses_old_protocol_before_the_greeting_or_job_requests() {
+        for dialed in [false, true] {
+            let (server, peer) = gradient_wire::testing::loopback().await;
+            let mut server = server.with_version(60);
+            let mut conn = ProtoConnection {
+                socket: peer.with_version(60),
+            };
+            if dialed {
+                server
+                    .send_msg(&ServerMessage::Authenticate {
+                        worker_id: "w1".into(),
+                        tokens: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            let error = if dialed {
+                perform_dialed_handshake_with_readiness(
+                    &mut conn,
+                    "w1".into(),
+                    None,
+                    all_caps(),
+                    true,
+                )
+                .await
+                .unwrap_err()
+            } else {
+                perform_handshake_with_readiness(&mut conn, "w1".into(), vec![], all_caps(), true)
+                    .await
+                    .unwrap_err()
+            };
+            assert!(
+                error.to_string().contains("requires protocol 61"),
+                "{error:#}"
+            );
+            drop(conn);
+            assert_eq!(server.recv_msg().await, None);
+        }
     }
 
     #[tokio::test]

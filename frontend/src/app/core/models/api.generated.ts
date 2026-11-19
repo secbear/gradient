@@ -287,6 +287,7 @@ export interface BoardUpstreamCacheStats {
 export interface BoardWorker {
   id?: string | null;
   name?: string | null;
+  health?: WorkerHealthInfo | null;
   projects: BoardProject[];
   draining: boolean;
   assigned_jobs: number;
@@ -3168,6 +3169,8 @@ export interface WebhookResponse {
 
 export type WebhookScope = "project" | "cache" | "instance" | "team";
 
+export type WorkerCheckStatus = "pending" | "passed" | "failed" | "timed_out" | "error";
+
 export interface WorkerConnection {
   connected: boolean;
   last_error?: ConnectionFailure | null;
@@ -3178,8 +3181,22 @@ export interface WorkerConnectionEntry {
   disconnected_at?: string | null;
 }
 
+export interface WorkerHealthCheck {
+  name: string;
+  status: WorkerCheckStatus;
+  healthy: boolean;
+}
+
+export interface WorkerHealthInfo {
+  ready: boolean;
+  checks: WorkerHealthCheck[];
+  observed_at?: string | null;
+  expires_at?: string | null;
+}
+
 export interface WorkerInfo {
   id: string;
+  health?: WorkerHealthInfo | null;
   capabilities: GradientCapabilities;
   architectures: string[];
   system_features: string[];
@@ -3191,6 +3208,7 @@ export interface WorkerInfo {
 }
 
 export interface WorkerLiveInfo {
+  health?: WorkerHealthInfo | null;
   capabilities: GradientCapabilities;
   architectures: string[];
   system_features: string[];

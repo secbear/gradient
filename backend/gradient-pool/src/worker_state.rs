@@ -72,6 +72,7 @@ pub struct WorkerProfile {
 }
 
 pub struct WorkerShared {
+    pub readiness: crate::WorkerReadiness,
     pub capabilities: GradientCapabilities,
     pub architectures: Vec<String>,
     pub system_features: Vec<String>,
@@ -236,6 +237,7 @@ impl TypedWorker<Active> {
     ) -> Self {
         Self {
             shared: WorkerShared {
+                readiness: crate::WorkerReadiness::default(),
                 capabilities,
                 architectures: vec![],
                 system_features: vec![],

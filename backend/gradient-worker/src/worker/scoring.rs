@@ -4,14 +4,32 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use gradient_wire::messages::{CandidateScore, JobCandidate, JobKind};
+use gradient_wire::messages::{CandidateScore, ClientMessage, JobCandidate, JobKind};
 use gradient_wire::traits::WorkerStore;
 use tracing::{Instrument as _, warn};
 
+use crate::health::HealthChecks;
 use crate::proto::scorer::JobScorer;
 use gradient_worker_client::connection::ProtoWriter;
+
+pub(super) struct ScoringReadiness {
+    pub(super) health: HealthChecks,
+    pub(super) refresh_pending: Arc<AtomicBool>,
+}
+
+impl ScoringReadiness {
+    fn ready(&self) -> bool {
+        if self.health.ready() {
+            return true;
+        }
+        self.refresh_pending.store(true, Ordering::Release);
+        false
+    }
+}
 
 pub(super) fn spawn_scoring_task<S: WorkerStore + ?Sized + 'static>(
     scorer: JobScorer,
@@ -20,6 +38,7 @@ pub(super) fn spawn_scoring_task<S: WorkerStore + ?Sized + 'static>(
     candidates: Vec<JobCandidate>,
     is_final: bool,
     request_after: Vec<JobKind>,
+    readiness: ScoringReadiness,
 ) {
     #[expect(
         clippy::disallowed_methods,
@@ -35,6 +54,7 @@ pub(super) fn spawn_scoring_task<S: WorkerStore + ?Sized + 'static>(
         {
             Ok(s) => s,
             Err(e) => {
+                readiness.refresh_pending.store(true, Ordering::Release);
                 warn!(error = %e, count, "score_candidates failed in spawned task");
                 return;
             }
@@ -47,67 +67,64 @@ pub(super) fn spawn_scoring_task<S: WorkerStore + ?Sized + 'static>(
             "scoring task complete"
         );
 
-        use gradient_wire::messages::ClientMessage;
-        if is_final {
-            if let Err(e) = send_score_chunks(&writer, to_send)
-                .instrument(tracing::debug_span!("send_scores"))
-                .await
-            {
-                warn!(error = %e, "send_score_chunks (final) failed");
-            }
-        } else {
-            for chunk in to_send.chunks(1_000) {
-                if let Err(e) = writer
-                    .send(ClientMessage::RequestJobChunk {
-                        scores: chunk.to_vec(),
-                        is_final: false,
-                    })
-                    .await
-                {
-                    warn!(error = %e, "send RequestJobChunk (non-final) failed");
-                    break;
-                }
-            }
-        }
-
-        // Scoring a fresh offer is clearing the server's rescore gate. Requesting here is sparing a
-        // dependency chain the wait for the next heartbeat.
-        for kind in request_after {
-            if let Err(e) = writer
-                .send(ClientMessage::RequestJob { kind: kind.clone() })
-                .instrument(tracing::debug_span!("request_job", ?kind))
-                .await
-            {
-                warn!(error = %e, ?kind, "RequestJob after scoring failed");
-            }
+        if let Err(e) = send_score_chunks(
+            move |message| {
+                let writer = writer.clone();
+                async move { writer.send(message).await }
+            },
+            to_send,
+            is_final,
+            request_after,
+            &readiness,
+        )
+        .instrument(tracing::debug_span!("send_scores"))
+        .await
+        {
+            readiness.refresh_pending.store(true, Ordering::Release);
+            warn!(error = %e, "send_score_chunks failed");
         }
     });
 }
 
-/// At least one message must go out, even with no scores. The server is waiting for the `is_final`
-/// sentinel.
-async fn send_score_chunks(
-    writer: &ProtoWriter,
+/// A ready worker sends a final sentinel even when it has no scores.
+pub(super) async fn send_score_chunks<F, Fut>(
+    send: F,
     scores: Vec<CandidateScore>,
-) -> anyhow::Result<()> {
-    use gradient_wire::messages::ClientMessage;
-    if scores.is_empty() {
-        writer
-            .send(ClientMessage::RequestJobChunk {
-                scores: vec![],
-                is_final: true,
-            })
-            .await?;
-        return Ok(());
+    is_final: bool,
+    request_after: Vec<JobKind>,
+    readiness: &ScoringReadiness,
+) -> anyhow::Result<()>
+where
+    F: Fn(ClientMessage) -> Fut + Send,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    if scores.is_empty() && is_final {
+        if !readiness.ready() {
+            return Ok(());
+        }
+        send(ClientMessage::RequestJobChunk {
+            scores: vec![],
+            is_final: true,
+        })
+        .await?;
     }
-    let chunks: Vec<_> = scores.chunks(1_000).collect();
-    let total = chunks.len();
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        writer
-            .send(ClientMessage::RequestJobChunk {
-                scores: chunk.to_vec(),
-                is_final: i + 1 == total,
-            })
+    let total = scores.len().div_ceil(1_000);
+    for (i, chunk) in scores.chunks(1_000).enumerate() {
+        if !readiness.ready() {
+            return Ok(());
+        }
+        send(ClientMessage::RequestJobChunk {
+            scores: chunk.to_vec(),
+            is_final: is_final && i + 1 == total,
+        })
+        .await?;
+    }
+    for kind in request_after {
+        if !readiness.ready() {
+            return Ok(());
+        }
+        send(ClientMessage::RequestJob { kind: kind.clone() })
+            .instrument(tracing::debug_span!("request_job", ?kind))
             .await?;
     }
     Ok(())
@@ -118,6 +135,73 @@ mod tests {
     use super::*;
     use gradient_test_support::prelude::{FakeWorkerStore, MockProtoServer};
     use gradient_worker_client::connection::ProtoConnection;
+
+    #[tokio::test]
+    async fn readiness_loss_during_a_send_stops_later_chunks_and_requests() {
+        for (is_final, count) in [(true, 2_001), (false, 2_001), (true, 0), (false, 0)] {
+            let (health, set_ready) = HealthChecks::controlled(true);
+            let readiness = ScoringReadiness {
+                health,
+                refresh_pending: Arc::new(AtomicBool::new(false)),
+            };
+            let scores = (0..count)
+                .map(|index| CandidateScore {
+                    job_id: format!("build:{index}"),
+                    missing_count: 0,
+                    missing_nar_size: 0,
+                    outputs_present: false,
+                })
+                .collect();
+            let permits = Arc::new(tokio::sync::Semaphore::new(0));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut sending = Box::pin(send_score_chunks(
+                |message| {
+                    let tx = tx.clone();
+                    let permits = Arc::clone(&permits);
+                    async move {
+                        tx.send(message).unwrap();
+                        permits.acquire().await.unwrap().forget();
+                        Ok(())
+                    }
+                },
+                scores,
+                is_final,
+                vec![JobKind::Build, JobKind::Flake],
+                &readiness,
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let first = tokio::select! {
+                    message = rx.recv() => message.unwrap(),
+                    result = &mut sending => panic!("send completed without a permit: {result:?}"),
+                };
+                match first {
+                    ClientMessage::RequestJobChunk {
+                        scores,
+                        is_final: final_chunk,
+                    } => {
+                        assert_eq!(scores.len(), count.min(1_000));
+                        assert_eq!(final_chunk, is_final && count == 0);
+                    }
+                    ClientMessage::RequestJob {
+                        kind: JobKind::Build,
+                    } => {
+                        assert_eq!((is_final, count), (false, 0));
+                    }
+                    message => panic!("unexpected first action: {message:?}"),
+                }
+                set_ready(false);
+                permits.add_permits(8);
+                sending.await.unwrap();
+                assert!(readiness.refresh_pending.load(Ordering::Acquire));
+                assert!(
+                    rx.try_recv().is_err(),
+                    "no further scores or job requests after readiness loss"
+                );
+            })
+            .await
+            .expect("the in-flight send finishes without continuing after readiness loss");
+        }
+    }
 
     #[tokio::test]
     async fn a_candidate_offered_again_is_scored_again() {
@@ -139,6 +223,10 @@ mod tests {
                 vec![candidate.clone()],
                 true,
                 Vec::new(),
+                ScoringReadiness {
+                    health: HealthChecks::default(),
+                    refresh_pending: Arc::new(AtomicBool::new(false)),
+                },
             );
             let scores = sc.scores().await.expect("the worker answers");
             let ids: Vec<&str> = scores.iter().map(|s| s.job_id.as_str()).collect();

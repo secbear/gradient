@@ -23,7 +23,7 @@ import { AuthService } from '@core/services/auth.service';
 import { signal } from '@angular/core';
 import { MenuItem } from '@gradient/ui/ui';
 import { MANAGED_ITEM_DISABLED_REASON } from '@shared/access';
-import { ProjectWorkerEntry } from '@core/models';
+import { ProjectWorkerEntry, WorkerHealthCheck, WorkerLiveInfo } from '@core/models';
 import { ApiError } from '@core/services/api.service';
 import { NotifyService } from '@core/services/notify.service';
 
@@ -357,7 +357,7 @@ describe('WorkersComponent - connection status', () => {
   it('shows a deactivated worker as inactive, also while it is still connected', async () => {
     const fixture = setup({
       access: { managed: false, canEdit: true, canTrigger: true },
-      workers: [{ ...workerUnmanaged, active: false, live }],
+      workers: [{ ...workerUnmanaged, active: false, connected: true, live }],
       caches: [{ id: 'c', name: 'cache-1' }],
     });
     await settled(fixture);
@@ -367,7 +367,7 @@ describe('WorkersComponent - connection status', () => {
   it('shows an active connected worker with its jobs and capacity, without a status badge', async () => {
     const fixture = setup({
       access: { managed: false, canEdit: true, canTrigger: true },
-      workers: [{ ...workerUnmanaged, live }],
+      workers: [{ ...workerUnmanaged, connected: true, live }],
       caches: [{ id: 'c', name: 'cache-1' }],
     });
     await settled(fixture);
@@ -383,6 +383,7 @@ describe('WorkersComponent - connection status', () => {
     });
     await settled(fixture);
     expect(status(fixture)).toBe('Connected, no jobs for this project (reconnect with the project token)');
+    expect(badges(fixture)).toContain('Unverified health');
   });
 
   it('shows a worker without a connection as offline', async () => {
@@ -393,6 +394,8 @@ describe('WorkersComponent - connection status', () => {
     });
     await settled(fixture);
     expect(status(fixture)).toBe('Offline');
+    expect(badges(fixture)).toContain('Unverified health');
+    expect(badges(fixture)).not.toContain('Ready');
   });
 });
 
@@ -429,6 +432,196 @@ const gciRegistration: ProjectWorkerEntry = {
 const gciTeam: ProjectWorkerEntry = { ...gciRegistration, worker_id: 'g2', team: 'platform', team_display_name: 'Platform Team', last_error: undefined };
 const writable: AccessState = { managed: false, canEdit: true, canTrigger: true };
 const caches = [{ id: 'c', name: 'c' }];
+
+describe('WorkersComponent - worker health', () => {
+  const live: WorkerLiveInfo = {
+    capabilities: { core: true, cache: false, federate: false, network: true, secrets: false, exec: false, eval: true, build: true },
+    architectures: [],
+    system_features: [],
+    max_concurrent_builds: 32,
+    assigned_job_count: 3,
+    draining: false,
+  };
+
+  describe('refresh', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-18T18:00:00Z'));
+      vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    });
+
+    afterEach(() => {
+      TestBed.resetTestingModule();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it.each([true, false])('renews a three-second report with initial ready=%s', (ready) => {
+      const initial: ProjectWorkerEntry = {
+        ...workerUnmanaged,
+        connected: true,
+        live: {
+          ...live,
+          health: {
+            ready,
+            checks: [{ name: 'Nix store', status: ready ? 'passed' : 'pending', healthy: ready }],
+            observed_at: '2026-11-18T18:00:00',
+            expires_at: '2026-11-18T18:00:03',
+          },
+        },
+      };
+      const fixture = setup({ access: writable, workers: [initial], caches });
+      fixture.detectChanges();
+      const getWorkers = TestBed.inject(WorkersService).getWorkers as ReturnType<typeof vi.fn>;
+      getWorkers.mockImplementation(() => of([{
+        ...initial,
+        live: {
+          ...live,
+          health: {
+            ready: true,
+            checks: [{ name: 'Nix store', status: 'passed', healthy: true }],
+            observed_at: new Date(Date.now()).toISOString(),
+            expires_at: new Date(Date.now() + 3000).toISOString(),
+          },
+        },
+      }]));
+      for (let elapsed = 500; elapsed <= 6000; elapsed += 500) {
+        vi.advanceTimersByTime(500);
+        fixture.detectChanges();
+        expect((fixture.nativeElement as HTMLElement).querySelector('app-worker-health gr-badge')?.textContent?.trim())
+          .toBe(ready || elapsed >= 1500 ? 'Ready' : 'Not ready');
+      }
+      expect(getWorkers).toHaveBeenCalledTimes(5);
+      expect((TestBed.inject(ProjectsService) as unknown as MockedProjects).getSubscribedCaches).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores disconnected deadlines and keeps legacy refresh at 15 seconds', () => {
+      const fixture = setup({
+        access: writable,
+        caches,
+        workers: [
+          { ...workerUnmanaged, connected: true, live },
+          {
+            ...workerOfTeam,
+            live: {
+              ...live,
+              health: {
+                ready: false,
+                checks: [{ name: 'Nix store', status: 'passed', healthy: true }],
+                expires_at: '2026-11-18T17:59:59',
+              },
+            },
+          },
+        ],
+      });
+      fixture.detectChanges();
+      const getWorkers = TestBed.inject(WorkersService).getWorkers as ReturnType<typeof vi.fn>;
+      vi.advanceTimersByTime(14_999);
+      expect(getWorkers).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(1);
+      expect(getWorkers).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it.each([
+    ['project worker', workerUnmanaged],
+    ['team worker', workerOfTeam],
+    ['Gradient.CI worker', gciRegistration],
+  ])('shows readiness and named checks on a connected %s', async (_, worker) => {
+    const fixture = setup({
+      access: writable,
+      workers: [{
+        ...worker,
+        connected: true,
+        live: { ...live, health: { ready: true, checks: [{ name: 'Nix store', status: 'passed', healthy: true }], observed_at: '2026-11-18T12:00:00' } },
+      }],
+      caches,
+    });
+    await settled(fixture);
+    const root = fixture.nativeElement as HTMLElement;
+    expect(root.querySelector('.worker-stats')?.textContent).toContain('Connected');
+    expect(root.querySelector('app-worker-health gr-badge')?.textContent?.trim()).toBe('Ready');
+    root.querySelector<HTMLButtonElement>('[aria-label="Worker health checks"]')!.click();
+    await settled(fixture);
+    expect(document.querySelector('.health-report')?.textContent).toContain('Nix store');
+    expect(document.querySelector('.health-report')?.textContent).toContain('Passed');
+  });
+
+  it.each<{ state: WorkerHealthCheck['status']; label: string }>([
+    { state: 'pending', label: 'Pending' },
+    { state: 'failed', label: 'Failed' },
+    { state: 'timed_out', label: 'Timed out' },
+    { state: 'error', label: 'Error' },
+  ])('shows a connected worker as not ready with a $state check', async ({ state, label }) => {
+    const fixture = setup({
+      access: writable,
+      workers: [{
+        ...workerUnmanaged,
+        connected: true,
+        live: { ...live, health: { ready: false, checks: [{ name: 'Nix store', status: state, healthy: false }], observed_at: '2026-11-18T12:00:00' } },
+      }],
+      caches,
+    });
+    await settled(fixture);
+    const root = fixture.nativeElement as HTMLElement;
+    expect(root.querySelector('.worker-stats')?.textContent).toContain('Connected');
+    expect(root.querySelector('app-worker-health gr-badge')?.textContent?.trim()).toBe('Not ready');
+    root.querySelector<HTMLButtonElement>('[aria-label="Worker health checks"]')!.click();
+    await settled(fixture);
+    expect(document.querySelector('.health-report')?.textContent).toContain(label);
+    expect(document.querySelector('.health-report')?.textContent).toContain('Unhealthy');
+  });
+
+  it('shows an initial missing report as not ready without inventing an observation time', async () => {
+    const fixture = setup({
+      access: writable,
+      workers: [{ ...workerUnmanaged, connected: true, live: { ...live, health: { ready: false, checks: [] } } }],
+      caches,
+    });
+    await settled(fixture);
+    const root = fixture.nativeElement as HTMLElement;
+    expect(root.querySelector('app-worker-health gr-badge')?.textContent?.trim()).toBe('Not ready');
+    root.querySelector<HTMLButtonElement>('[aria-label="Worker health checks"]')!.click();
+    await settled(fixture);
+    const report = document.querySelector('.health-report')!;
+    expect(report.textContent).toContain('No health report received.');
+    expect(report.textContent).not.toContain('Report received');
+    expect(report.querySelector('li')).toBeNull();
+  });
+
+  it('shows names as text and keeps health unavailable after disconnecting', async () => {
+    const name = '<img src=x onerror=alert(1)>';
+    const fixture = setup({
+      access: writable,
+      workers: [{
+        ...workerUnmanaged,
+        connected: true,
+        live: { ...live, health: { ready: true, checks: [{ name, status: 'passed', healthy: true }], observed_at: '2026-11-18T12:00:00' } },
+      }],
+      caches,
+    });
+    await settled(fixture);
+    const root = fixture.nativeElement as HTMLElement;
+    root.querySelector<HTMLButtonElement>('[aria-label="Worker health checks"]')!.click();
+    await settled(fixture);
+    const report = document.querySelector('.health-report')!;
+    expect(report.querySelector('.check-name')?.textContent).toBe(name);
+    expect(report.querySelector('img')).toBeNull();
+
+    fixture.componentInstance.workers.update((workers) => workers.map((worker) => ({ ...worker, connected: false })));
+    await settled(fixture);
+    expect(root.querySelector('.worker-stats')?.textContent).toContain('Offline');
+    expect(root.querySelector('app-worker-health gr-badge')?.textContent?.trim()).toBe('Health unavailable');
+    expect(report.textContent).toContain('Last health report (worker offline)');
+
+    fixture.componentInstance.workers.update((workers) => workers.map((worker) => ({ ...worker, live: null })));
+    await settled(fixture);
+    expect(root.querySelector('.worker-stats')?.textContent).toContain('Offline');
+    expect(root.querySelector('app-worker-health gr-badge')?.textContent?.trim()).toBe('Unverified health');
+    expect(root.querySelector('[aria-label="Worker health checks"]')).toBeNull();
+    expect(document.querySelector('.health-report')).toBeNull();
+  });
+});
 
 describe('WorkersComponent - Gradient.CI Servers entry', () => {
   it('offers Connect when nothing is connected', async () => {

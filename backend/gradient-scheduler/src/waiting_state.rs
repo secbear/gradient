@@ -814,7 +814,7 @@ fn eligible_for(worker: &WorkerInfo, project: Option<ProjectId>) -> bool {
 fn project_worker_caps(workers: &[WorkerInfo], project: Option<ProjectId>) -> Vec<BuildWorkerCaps> {
     workers
         .iter()
-        .filter(|w| eligible_for(w, project))
+        .filter(|w| eligible_for(w, project) && w.health_ready())
         .map(BuildWorkerCaps::from)
         .collect()
 }
@@ -833,13 +833,16 @@ impl ProjectWorkerCounts {
         workers
             .iter()
             .filter(|w| eligible_for(w, project))
-            .fold(Self::default(), |counts, w| Self {
-                eval: counts.eval + usize::from(w.capabilities.eval),
-                network: counts.network + usize::from(w.capabilities.network),
-                secrets: counts.secrets
-                    + usize::from(w.capabilities.network && w.capabilities.secrets),
-                exec: counts.exec + usize::from(w.capabilities.exec),
-                connected: counts.connected + 1,
+            .fold(Self::default(), |counts, w| {
+                let capabilities = w.job_capabilities();
+                Self {
+                    eval: counts.eval + usize::from(capabilities.eval),
+                    network: counts.network + usize::from(capabilities.network),
+                    secrets: counts.secrets
+                        + usize::from(capabilities.network && capabilities.secrets),
+                    exec: counts.exec + usize::from(capabilities.exec),
+                    connected: counts.connected + 1,
+                }
             })
     }
 
@@ -969,6 +972,7 @@ mod tests {
     fn worker(eval: bool, authorized_peers: Option<HashSet<ProjectId>>) -> WorkerInfo {
         WorkerInfo {
             id: "00000000-0000-4000-8000-000000000001".into(),
+            health: None,
             capabilities: gradient_wire::types::GradientCapabilities {
                 eval,
                 network: eval,
@@ -1004,6 +1008,20 @@ mod tests {
             system_features: features.iter().map(|f| f.to_string()).collect(),
             ..base
         }
+    }
+
+    #[test]
+    fn unready_workers_are_connected_but_supply_no_usable_capabilities() {
+        let mut worker = worker(true, None);
+        assert_eq!(ProjectWorkerCounts::of(&[worker.clone()], None).eval, 1);
+        worker.health = gradient_pool::WorkerReadiness::pending(true).info();
+        let counts = ProjectWorkerCounts::of(&[worker.clone()], None);
+        assert_eq!(counts.connected, 1);
+        assert_eq!(counts.eval, 0);
+        assert_eq!(counts.network, 0);
+        assert_eq!(counts.secrets, 0);
+        assert_eq!(counts.exec, 0);
+        assert!(project_worker_caps(&[worker], None).is_empty());
     }
 
     fn x86_gap(connected_workers: u32) -> WaitingReason {

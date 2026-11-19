@@ -197,6 +197,10 @@ mod tests {
             )])]])
             .append_exec_results([exec(0)])
             .append_query_results([
+                vec![BTreeMap::from([(
+                    "derivation".to_owned(),
+                    Value::from(uuid::Uuid::now_v7()),
+                )])],
                 locked(),
                 vec![BTreeMap::from([(
                     "derivation".to_owned(),
@@ -208,6 +212,10 @@ mod tests {
             .append_query_results([drifted])
             .append_query_results([empty.clone(), empty.clone()])
             .append_exec_results([exec(5)])
+            .append_query_results([vec![BTreeMap::from([(
+                "derivation".to_owned(),
+                Value::from(uuid::Uuid::now_v7()),
+            )])]])
             .append_query_results([locked(), empty.clone(), empty.clone()]);
         db = if hole {
             db.append_query_results([vec![BTreeMap::from([(
@@ -294,52 +302,55 @@ mod tests {
             "the repair scope is read once, contradicting flags included: {log:?}"
         );
         assert!(
-            log[7].contains("FOR NO KEY UPDATE")
-                && log[8].contains("SET fetchable = true")
-                && log[9].contains("blocking_deps - c.n")
-                && log[10].contains("SET fetchable = false"),
+            log[7].contains("db.fetchable <>")
+                && log[8].contains("FOR NO KEY UPDATE")
+                && log[9].contains("SET fetchable = true")
+                && log[10].contains("blocking_deps - c.n")
+                && log[11].contains("SET fetchable = false"),
             "the flag is repaired under its own ordered lock, before the need walk \
              that stops at a fetchable shared build: {log:?}"
         );
         assert!(
-            log[11].contains("SET LOCAL work_mem") && log[12].contains("SET wanted ="),
+            log[12].contains("SET LOCAL work_mem") && log[13].contains("SET wanted ="),
             "the table-wide need walk takes place under its own raise, on a repaired flag: {log:?}"
         );
         assert!(
-            log[13].contains("db.status IN (5, 10) AND db.wanted")
-                && log[14].contains("db.status = 0 AND NOT db.wanted"),
+            log[14].contains("db.status IN (5, 10) AND db.wanted")
+                && log[15].contains("db.status = 0 AND NOT db.wanted"),
             "both Skipped directions read the need this pass corrected: {log:?}"
         );
         assert!(
-            log[15].contains("FOR NO KEY UPDATE") && log[16].contains("SET blocking_deps"),
+            log[16].contains("db.blocking_deps <>")
+                && log[17].contains("FOR NO KEY UPDATE")
+                && log[18].contains("SET blocking_deps"),
             "the counter recount follows the need recount, in a second locked pass \
              over the same scope: {log:?}"
         );
         assert!(
-            log[17].contains("SET status = 0") && log[18].contains("SET status = 1"),
+            log[19].contains("SET status = 0") && log[20].contains("SET status = 1"),
             "the queue is settled against the repaired counters and the corrected need: {log:?}"
         );
         assert!(
-            log[19].contains(
+            log[21].contains(
                 "NOT EXISTS (SELECT 1 FROM build_job bj WHERE bj.derivation = db.derivation) LIMIT 1"
             ),
             "the naming backstop asks before it walks: {log:?}"
         );
         assert!(
-            log[20].contains("SELECT DISTINCT o.hash"),
+            log[22].contains("SELECT DISTINCT o.hash"),
             "the unbacked alarm follows the repairs: {log:?}"
         );
         assert!(
-            log[21].contains("SELECT id FROM evaluation WHERE status IN")
-                && log[22].contains("pg_advisory_xact_lock")
-                && log[23].contains("DELETE FROM evaluation_shared_build_delta"),
+            log[23].contains("SELECT id FROM evaluation WHERE status IN")
+                && log[24].contains("pg_advisory_xact_lock")
+                && log[25].contains("DELETE FROM evaluation_shared_build_delta"),
             "the evaluation counters are recounted under the fold's lock: {log:?}"
         );
         assert!(
-            log[24].contains("active_shared_builds = 0"),
+            log[26].contains("active_shared_builds = 0"),
             "the wedged alarm reads the counters the recount just corrected: {log:?}"
         );
-        assert_eq!(log.len(), 25, "{log:?}");
+        assert_eq!(log.len(), 27, "{log:?}");
     }
 
     #[tokio::test]
@@ -351,25 +362,25 @@ mod tests {
         assert_eq!(report.adopted, 1);
         let log = statements(pool.into_transaction_log());
         assert!(
-            log[19].contains("LIMIT 1")
-                && log[20].contains("SET LOCAL work_mem")
-                && log[21].contains("INSERT INTO build_job"),
+            log[21].contains("LIMIT 1")
+                && log[22].contains("SET LOCAL work_mem")
+                && log[23].contains("INSERT INTO build_job"),
             "the probe guards the walk that names: {log:?}"
         );
         assert!(
-            log[22].contains("SET LOCAL work_mem")
-                && log[23].contains("ORDER BY derivation FOR NO KEY UPDATE")
-                && log[24].contains("ON d.derivation = r.derivation ORDER BY r.derivation"),
+            log[24].contains("SET LOCAL work_mem")
+                && log[25].contains("ORDER BY derivation FOR NO KEY UPDATE")
+                && log[26].contains("ON d.derivation = r.derivation ORDER BY r.derivation"),
             "a name gives the closure below it a need, in this pass and not the next: {log:?}"
         );
         assert!(
-            log[25].contains("SET status = 1")
-                && log[26].contains("graph_version = e.graph_version + 1"),
+            log[27].contains("SET status = 1")
+                && log[28].contains("graph_version = e.graph_version + 1"),
             "then queue what was named and bump: {log:?}"
         );
         assert!(
-            log[27].contains("SELECT DISTINCT o.hash")
-                && log[31].contains("active_shared_builds = 0"),
+            log[29].contains("SELECT DISTINCT o.hash")
+                && log[33].contains("active_shared_builds = 0"),
             "the alarms still come last: {log:?}"
         );
     }

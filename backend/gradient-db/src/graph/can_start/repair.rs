@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
+use crate::graph::predicates::fetchable_predicate;
 use crate::graph::promotion::{returned_derivations, returned_transitions, transitions_from};
 use crate::status::TransitionChange;
 
@@ -58,6 +59,32 @@ crate::sql_lazy! {
         tier = Bulk;
 }
 
+fn fetchable_repair_candidates() -> String {
+    format!(
+        "SELECT db.derivation FROM derivation_build db \
+         WHERE db.derivation = ANY($1::uuid[]) AND db.fetchable <> {fetchable}",
+        fetchable = fetchable_predicate("db"),
+    )
+}
+
+fn blocking_repair_candidates() -> String {
+    format!(
+        "SELECT db.derivation FROM derivation_build db \
+         WHERE db.derivation = ANY($1::uuid[]) AND db.blocking_deps <> {count}",
+        count = blocking_dependency_count("db"),
+    )
+}
+
+crate::sql_fn! {
+    FETCHABLE_REPAIR_CANDIDATES = fetchable_repair_candidates,
+        params = [DerivationIds(64)],
+        tier = Sweep;
+
+    BLOCKING_REPAIR_CANDIDATES = blocking_repair_candidates,
+        params = [DerivationIds(64)],
+        tier = Sweep;
+}
+
 #[derive(Debug, Default)]
 pub struct RepairedFetchable {
     pub marked: u64,
@@ -110,7 +137,15 @@ where
     C: ConnectionTrait + TransactionTrait<Transaction = DatabaseTransaction>,
 {
     let mut repaired = RepairedFetchable::default();
-    for chunk in scope.chunks(SWEEP_LOCK_CHUNK) {
+    if scope.is_empty() {
+        return Ok(repaired);
+    }
+    let candidates = returned_derivations(
+        db.query_all_raw(FETCHABLE_REPAIR_CANDIDATES.bind([ids(scope)]))
+            .await?,
+    );
+    // Selection only narrows the work; each mark still rechecks its predicate under the lock.
+    for chunk in candidates.chunks(SWEEP_LOCK_CHUNK) {
         let txn = db.begin().await?;
         let Some(lock) = try_lock_shared_builds(&txn, chunk).await? else {
             skip_held_chunk(txn, chunk.len()).await?;
@@ -135,7 +170,15 @@ where
     C: ConnectionTrait + TransactionTrait<Transaction = DatabaseTransaction>,
 {
     let mut blocking_deps = 0u64;
-    for chunk in scope.chunks(SWEEP_LOCK_CHUNK) {
+    let candidates = if scope.is_empty() {
+        Vec::new()
+    } else {
+        returned_derivations(
+            db.query_all_raw(BLOCKING_REPAIR_CANDIDATES.bind([ids(scope)]))
+                .await?,
+        )
+    };
+    for chunk in candidates.chunks(SWEEP_LOCK_CHUNK) {
         let txn = db.begin().await?;
         let Some(lock) = try_lock_shared_builds(&txn, chunk).await? else {
             skip_held_chunk(txn, chunk.len()).await?;
@@ -225,12 +268,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_clean_scope_takes_no_repair_locks() {
+        let scope: Vec<_> = (0..SWEEP_LOCK_CHUNK + 1)
+            .map(|_| DerivationId::now_v7())
+            .collect();
+        let empty = Vec::<BTreeMap<String, Value>>::new;
+        let db = mock_db()
+            .append_query_results([empty(), empty(), empty(), empty()])
+            .into_connection();
+
+        let fetchable = repair_fetchable(&db, &scope).await.unwrap();
+        let repaired = repair_can_start(&db, &scope).await.unwrap();
+        assert_eq!((fetchable.marked, repaired.blocking_deps), (0, 0));
+        assert!(repaired.promoted.is_empty());
+        assert!(repaired.unpromoted.is_empty());
+        let log = statements(db.into_transaction_log());
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert!(
+            !log.iter().any(|s| s.contains("FOR NO KEY UPDATE")),
+            "clean rows must not enter the lock/savepoint loop: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_candidate_corrected_before_its_lock_needs_no_parent_update() {
+        let candidate = DerivationId::now_v7();
+        let empty = Vec::<BTreeMap<String, Value>>::new;
+        let db = mock_db()
+            .append_query_results([vec![drv(candidate)], locked(), empty(), empty()])
+            .into_connection();
+
+        let repaired = repair_fetchable(&db, &[candidate]).await.unwrap();
+        assert_eq!(repaired.marked, 0);
+        assert!(repaired.unqueued.is_empty());
+        let log = statements(db.into_transaction_log());
+        assert!(
+            !log.iter().any(|s| s.contains("blocking_deps - c.n") || s.contains("blocking_deps + c.n")),
+            "only a mark that still changes the flag may ripple: {log:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_repaired_column_adjusts_its_parents_in_the_same_transaction_and_queues_nothing() {
         let now_fetchable = DerivationId::now_v7();
         let unblocked_parent = DerivationId::now_v7();
         let no_longer_fetchable = DerivationId::now_v7();
         let unqueued_parent = DerivationId::now_v7();
         let db = mock_db()
+            .append_query_results([vec![drv(now_fetchable), drv(no_longer_fetchable)]])
             .append_query_results([locked()])
             .append_query_results([vec![drv(now_fetchable)]])
             .append_query_results([vec![startable_row(unblocked_parent)]])
@@ -251,8 +336,8 @@ mod tests {
         );
 
         let raw = db.into_transaction_log();
-        assert_eq!(raw.len(), 1, "{raw:?}");
-        let inside: Vec<&str> = raw[0].statements().iter().map(|s| s.sql.as_str()).collect();
+        assert_eq!(raw.len(), 2, "{raw:?}");
+        let inside: Vec<&str> = raw[1].statements().iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(
             inside.len(),
             7,
@@ -282,7 +367,9 @@ mod tests {
         let empty = Vec::<BTreeMap<String, Value>>::new;
         let db = mock_db()
             .append_query_results([vec![drv(a)]])
-            .append_query_results([locked(), empty(), empty(), locked()])
+            .append_query_results([vec![drv(a)]])
+            .append_query_results([locked(), empty(), empty()])
+            .append_query_results([vec![drv(a)], locked()])
             .append_exec_results([exec(3)])
             .append_query_results([vec![transition_row(demoted, 1, 0)]])
             .append_query_results([vec![drv(promoted)]])
@@ -301,11 +388,11 @@ mod tests {
         let raw = db.into_transaction_log();
         assert_eq!(
             raw.len(),
-            5,
-            "the scope select, one transaction per pass, then the queue: {raw:?}"
+            7,
+            "scope, two candidate selects, one transaction per pass, then the queue: {raw:?}"
         );
 
-        for (entry, first_write) in [(1, "SET fetchable = true"), (2, "SET blocking_deps = x.n")] {
+        for (entry, first_write) in [(2, "SET fetchable = true"), (4, "SET blocking_deps = x.n")] {
             let inside: Vec<&str> = raw[entry]
                 .statements()
                 .iter()
@@ -329,7 +416,7 @@ mod tests {
         let empty = Vec::<BTreeMap<String, Value>>::new;
         let db = mock_db()
             .append_query_results([vec![drv(a)]])
-            .append_query_results([empty(), locked()])
+            .append_query_results([vec![drv(a)], empty(), vec![drv(a)], locked()])
             .append_exec_results([exec(1)])
             .append_query_results([empty(), empty()])
             .into_connection();
@@ -340,7 +427,7 @@ mod tests {
 
         assert_eq!((fetchable.marked, repaired.blocking_deps), (0, 1));
         let raw = db.into_transaction_log();
-        let skipped: Vec<&str> = raw[1].statements().iter().map(|s| s.sql.as_str()).collect();
+        let skipped: Vec<&str> = raw[2].statements().iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(
             skipped.len(),
             3,
@@ -359,8 +446,9 @@ mod tests {
             .collect();
         let empty = Vec::<BTreeMap<String, Value>>::new;
         let db = mock_db()
-            .append_query_results([scope])
+            .append_query_results([scope.clone(), scope.clone()])
             .append_query_results([locked(), empty(), empty(), locked(), empty(), empty()])
+            .append_query_results([scope])
             .append_query_results([locked(), locked()])
             .append_exec_results(vec![exec(1); 2])
             .append_query_results([empty(), empty()])

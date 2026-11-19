@@ -16,6 +16,23 @@ use super::{
 use crate::messages::{Demotion, Transition};
 
 #[tokio::test]
+async fn consistency_candidates_repair_flags_and_counters_before_queueing() {
+    let case = Case::start(chain_done(EvaluationId::now_v7())).await;
+    case.override_sb(B, |row| row.fetchable = false).await;
+    case.override_sb(A, |row| row.blocking_deps = 9).await;
+
+    let report = case.drift().await;
+    assert_eq!(report.counter_drift, 2);
+    assert!(case.sb(B).await.fetchable);
+    assert_eq!(
+        (case.sb(A).await.status, case.sb(A).await.blocking_deps),
+        (BuildStatus::Queued, 0)
+    );
+    case.zero_drift("the repaired candidates").await;
+    case.finish().await;
+}
+
+#[tokio::test]
 async fn q01_a_build_queues_only_after_the_walk_and_the_probe_answer() {
     let e1 = EvaluationId::now_v7();
     let case = Case::start(

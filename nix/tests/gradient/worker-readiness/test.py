@@ -3,6 +3,7 @@
 
 import shlex
 import time
+from datetime import datetime
 from uuid import UUID
 
 API = "http://127.0.0.1:3000/api/v1"
@@ -72,6 +73,20 @@ def failed_report_since(observed_at):
             for check in health.get("checks", [])
         )
     )
+
+
+def fresh_healthy_report():
+    started = time.monotonic()
+    entry = checked_entry()
+    health = entry.get("live", {}).get("health", {})
+    if not entry["connected"] or not health.get("ready"):
+        return False
+    captured_at = assessment()["captured_at"]
+    remaining = (
+        datetime.fromisoformat(health["expires_at"])
+        - datetime.fromisoformat(captured_at)
+    ).total_seconds() - (time.monotonic() - started)
+    return remaining >= 30
 
 
 def connection_id():
@@ -174,6 +189,7 @@ with subtest("Startup failure blocks only eligible checked work"):
     long_eval = evaluate("long")
     poll(unusable, "unready worker supplied usable capacity or starting credit")
     assert dispatch_workers(long_eval) == []
+    readiness_checkpoint("startup-unready")
     plain_eval = evaluate("plain")
     complete(plain_eval)
     assert dispatch_workers(plain_eval) == [WORKER_IDS["unchecked"]]
@@ -188,7 +204,20 @@ with subtest("Recovery starts the queued build"):
     snapshot = assessment()
     index = snapshot["tracked_workers"][0]["worker_index"]
     assert index is not None and snapshot["workers"][index]["free_slots"] == 1
-    control_eval = evaluate("control")
+    poll(fresh_healthy_report, "worker did not publish a fresh healthy lease", timeout=45)
+    paused_deadline = time.monotonic() + 20
+    try:
+        checked.succeed("systemctl kill --signal=STOP gradient-worker.service")
+        control_eval = evaluate("control")
+        poll(lambda: ready(True) and usable() and assessment()["total_ready_builds"] > 0,
+             "healthy worker lost its free slot before queued work was assessed",
+             timeout=max(0, paused_deadline - time.monotonic()))
+        assert dispatch_workers(control_eval) == []
+        assert time.monotonic() < paused_deadline, "healthy observation budget exhausted"
+        readiness_checkpoint("ready-busy", deadline=paused_deadline)
+        assert time.monotonic() < paused_deadline, "healthy observation budget exhausted"
+    finally:
+        checked.succeed("systemctl kill --signal=CONT gradient-worker.service")
     complete(control_eval)
     assert dispatch_workers(control_eval) == [WORKER_IDS["checked"]]
     checked.succeed("test ! -e /run/gradient-readiness-build/release-long")
@@ -200,6 +229,7 @@ with subtest("Check failure preserves running work and blocks new work"):
     next_eval = evaluate("next")
     poll(unusable, "unhealthy worker still supplied new-build capacity")
     assert dispatch_workers(next_eval) == []
+    readiness_checkpoint("periodic-unready")
     assert checked_entry()["live"]["assigned_job_count"] == 1
     checked.succeed("touch /run/gradient-readiness-build/release-long")
     complete(long_eval)
@@ -234,20 +264,32 @@ with subtest("A new worker session cannot retain previous readiness"):
 
     poll(new_session_pending, "a new connection did not report its pending startup check", timeout=20)
     checked.succeed("test -e /run/gradient-readiness/healthy")
+    pending_eval = evaluate("pending")
+    poll(unusable, "pending startup supplied usable capacity or starting credit")
+    assert dispatch_workers(pending_eval) == []
+    readiness_checkpoint("reconnect-pending")
     checked.succeed("rm /run/gradient-readiness/hold-startup")
     poll(lambda: ready(True), "reconnected worker did not recover")
+    complete(pending_eval)
+    assert dispatch_workers(pending_eval) == [WORKER_IDS["checked"]]
 
 with subtest("Health expires before connection liveness"):
     checked.succeed("systemctl kill --signal=STOP gradient-worker.service")
     try:
-        poll(lambda: ready(False), "server did not expire an unrefreshed health report", timeout=20)
+        poll(lambda: ready(False), "server did not expire an unrefreshed health report", timeout=45)
         assert checked_entry()["connected"]
         snapshot = assessment()
         assert snapshot["tracked_workers"][0]["connected"]
         assert snapshot["tracked_workers"][0]["worker_index"] is None
+        expired_eval = evaluate("expired")
+        poll(unusable, "expired report supplied usable capacity or starting credit")
+        assert dispatch_workers(expired_eval) == []
+        readiness_checkpoint("expired-connected")
     finally:
         checked.succeed("systemctl kill --signal=CONT gradient-worker.service")
     poll(lambda: ready(True), "fresh reports did not restore readiness")
+    complete(expired_eval)
+    assert dispatch_workers(expired_eval) == [WORKER_IDS["checked"]]
 
 with subtest("An unhealthy worker reclaims active work after server restart"):
     restart_eval = evaluate("restart")
@@ -265,6 +307,8 @@ with subtest("An unhealthy worker reclaims active work after server restart"):
     poll(lambda: ready(False) and checked_entry()["live"]["assigned_job_count"] == 1,
          "server restart did not reclaim the unhealthy worker's active build")
     assert dispatch_workers(after_restart_eval) == []
+    poll(unusable, "reclaimed unhealthy worker supplied usable capacity")
+    readiness_checkpoint("reclaimed-unready")
     checked.succeed("test $(wc -l < /run/gradient-readiness-build/restart-starts) -eq 1")
     checked.succeed("touch /run/gradient-readiness-build/release-restart")
     complete(restart_eval)

@@ -50,6 +50,8 @@
         long = mk "long" [ "readiness-fixture" ] "long";
         next = mk "next" [ "readiness-fixture" ] null;
         control = mk "control" [ "readiness-fixture" ] null;
+        pending = mk "pending" [ "readiness-fixture" ] null;
+        expired = mk "expired" [ "readiness-fixture" ] null;
         restart = mk "restart" [ "readiness-fixture" ] "restart";
         after-restart = mk "after-restart" [ "readiness-fixture" ] null;
       };

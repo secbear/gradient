@@ -39,7 +39,7 @@ let
           "-e"
           "/run/gradient-readiness/healthy"
         ];
-        intervalSecs = 1;
+        intervalSecs = 30;
         timeoutSecs = 1;
         failureThreshold = 1;
         successThreshold = 1;
@@ -92,7 +92,19 @@ let
   };
 in
 {
-  value = pkgs.testers.runNixOSTest {
+  value = pkgs.testers.runNixOSTest ({ config, ... }: {
+    imports = [
+      {
+        options.readiness.checkpointScript = lib.mkOption {
+          type = lib.types.lines;
+          default = ''
+            def readiness_checkpoint(phase, deadline=None):
+                pass
+          '';
+          description = "Python callback for readiness checkpoints.";
+        };
+      }
+    ];
     name = "gradient-worker-readiness";
     globalTimeout = 1200;
 
@@ -173,7 +185,7 @@ in
               token_file = toString (pkgs.writeText "worker-token" workerToken);
               created_by = "admin";
             }) workerIds;
-            tasks = lib.genAttrs [ "long" "next" "plain" "control" "restart" "after-restart" ] (name: {
+            tasks = lib.genAttrs [ "long" "next" "plain" "control" "pending" "expired" "restart" "after-restart" ] (name: {
               project = "project";
               repository = "git://server/worker-readiness";
               wildcard = "packages.${system}.${name}";
@@ -216,7 +228,8 @@ in
       SYSTEM = ${builtins.toJSON system}
       FLAKE = ${builtins.toJSON (toString flake)}
       WORKER_IDS = json.loads(${builtins.toJSON (builtins.toJSON workerIds)})
+      ${config.readiness.checkpointScript}
       ${builtins.readFile ./test.py}
     '';
-  };
+  });
 }

@@ -25,6 +25,7 @@ use gradient_test_support::web::{signed_in, signed_in_as};
 use gradient_util::shutdown::Shutdown;
 use gradient_wire::types::{
     BuildJob, BuildRequirement, BuildSpec, BuildSpecKind, GradientCapabilities, JobKind,
+    WorkerCheckStatus, WorkerHealth, WorkerHealthCheck,
 };
 use sea_orm::{DatabaseConnection, MockDatabase};
 use serde_json::{Value, json};
@@ -276,9 +277,20 @@ impl CapacityTest {
         projects: HashSet<ProjectId>,
         active: Vec<Reattached>,
     ) -> mpsc::UnboundedReceiver<SessionSignal> {
+        self.worker_with_active_and_readiness(identity, projects, active, false)
+            .await
+    }
+
+    async fn worker_with_active_and_readiness(
+        &self,
+        identity: &str,
+        projects: HashSet<ProjectId>,
+        active: Vec<Reattached>,
+        readiness_required: bool,
+    ) -> mpsc::UnboundedReceiver<SessionSignal> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.scheduler
-            .reattach_worker(
+            .reattach_worker_with_readiness(
                 identity,
                 GradientCapabilities {
                     build: true,
@@ -289,6 +301,7 @@ impl CapacityTest {
                 Arc::new(tx),
                 active,
                 false,
+                readiness_required,
             )
             .await
             .expect("attach worker");
@@ -1223,6 +1236,156 @@ async fn connected_out_of_scope_tracking_never_becomes_starting_supply_even_for_
             assert_eq!(message["builds"][0]["workers"], json!([]));
             assert_eq!(message["builds"][0]["tracked_workers"], json!([null]));
         }
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn checked_workers_only_supply_live_capacity_when_ready_and_never_starting_credit() {
+    for (results, expires, ready) in [
+        (vec![], false, false),
+        (vec![true], false, true),
+        (vec![false], false, false),
+        (vec![false, true], false, true),
+        (vec![true], true, false),
+    ] {
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let db = unregistered(
+            grants(db, &[project_id()]).append_query_results([vec![team_registration(LIVE)]]),
+            1,
+        );
+        let test = CapacityTest::start(db, auth).await;
+        test.enqueue(build(
+            project_id(),
+            0,
+            BuildEstimate::fixed(Some(1_000), None, 1),
+        ))
+        .await;
+        let mut signals = test
+            .worker_with_active_and_readiness(LIVE, HashSet::from([project_id()]), vec![], true)
+            .await;
+        let session = test.scheduler.worker_port(LIVE).await.unwrap();
+        for healthy in results {
+            test.scheduler
+                .update_worker_health(
+                    LIVE,
+                    Arc::clone(&session),
+                    WorkerHealth {
+                        checks: vec![WorkerHealthCheck {
+                            name: "nix-store".into(),
+                            status: if healthy {
+                                WorkerCheckStatus::Passed
+                            } else {
+                                WorkerCheckStatus::Failed
+                            },
+                            healthy,
+                        }],
+                        valid_for_secs: if expires { 1 } else { 86_400 },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        if expires {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while test.scheduler.board_workers().await[0].health_ready() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("health report expired");
+        }
+        while signals.try_recv().is_ok() {}
+        let before = test.scheduler.metrics_snapshot().await;
+        let res = test
+            .post(&json!({
+                "profiles": [profile("replacement", INTENDED, 60_000)],
+                "tracked_profiles": [profile("already-connected", LIVE, 128_000)]
+            }))
+            .await;
+        res.assert_status_ok();
+        let body: Value = res.json();
+        let message = &body["message"];
+        assert_eq!(message["total_ready_builds"], 1);
+        assert_eq!(
+            message["workers"].as_array().unwrap().len(),
+            usize::from(ready)
+        );
+        assert_eq!(
+            message["builds"][0]["workers"].as_array().unwrap().len(),
+            usize::from(ready)
+        );
+        assert!(message["builds"][0]["profiles"][0].is_object());
+        assert_eq!(message["tracked_workers"][0]["connected"], true);
+        assert_eq!(
+            message["tracked_workers"][0]["worker_index"],
+            if ready { json!(0) } else { Value::Null }
+        );
+        assert_eq!(message["builds"][0]["tracked_workers"], json!([null]));
+        if ready {
+            assert_eq!(message["workers"][0]["free_slots"], 2);
+            assert!(message["builds"][0]["workers"][0].is_object());
+        }
+        assert!(test.scheduler.is_worker_connected(LIVE).await);
+        assert_eq!(test.scheduler.metrics_snapshot().await, before);
+        while let Ok(signal) = signals.try_recv() {
+            assert!(matches!(signal, SessionSignal::Offers(_)), "{signal:?}");
+        }
+        assert_no_registration_or_dispatch(&test.web_db);
+        assert_no_registration_or_dispatch(&test.worker_db);
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn fleet_limits_accept_complete_supply_and_reject_oversized_scans() {
+    for (workers, readiness_required, accepted) in [
+        (256, false, true),
+        (257, false, false),
+        (1_024, true, false),
+    ] {
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let test = CapacityTest::start(grants(db, &[project_id()]), auth).await;
+        test.enqueue(build(project_id(), 0, BuildEstimate::default()))
+            .await;
+        for index in 0..workers {
+            test.worker_with_active_and_readiness(
+                &format!("fleet-{index}"),
+                HashSet::from([project_id()]),
+                vec![],
+                readiness_required,
+            )
+            .await;
+        }
+        let before = test.scheduler.metrics_snapshot().await;
+        let res = test.post(&json!({ "profiles": [] })).await;
+        res.assert_status(if accepted {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        });
+        let body: Value = res.json();
+        if accepted {
+            assert_eq!(body["message"]["total_ready_builds"], 1);
+            assert_eq!(
+                body["message"]["workers"].as_array().unwrap().len(),
+                workers
+            );
+            assert_eq!(
+                body["message"]["builds"][0]["workers"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                workers
+            );
+        } else {
+            assert_eq!(body["error"], true);
+            assert_eq!(body["code"], "service_unavailable");
+        }
+        assert_eq!(test.scheduler.metrics_snapshot().await, before);
+        assert_eq!(test.scheduler.board_workers().await.len(), workers);
+        assert_no_registration_or_dispatch(&test.web_db);
+        assert_no_registration_or_dispatch(&test.worker_db);
         test.stop().await;
     }
 }

@@ -1677,6 +1677,182 @@ mod tests {
         assert!(core.pool.is_connected("w1"));
     }
 
+    #[tokio::test]
+    #[ignore = "local scheduler scale probe; run with --ignored --nocapture"]
+    async fn readiness_scale_probe() {
+        use gradient_test_support::state::TestState;
+        use gradient_wire::types::{WorkerCheckStatus, WorkerHealth, WorkerHealthCheck};
+
+        for (worker_count, backlog) in [
+            (64, 4_096),
+            (256, 4_096),
+            (1_024, 100_000),
+            (10_000, 100_000),
+        ] {
+            for check_count in [0, 32] {
+                let started = Instant::now();
+                let state = TestState::new().build();
+                let scheduler = crate::Scheduler::new(Arc::clone(&state));
+                let actor = scheduler.spawn_core(None).await.unwrap();
+                let project = ProjectId::now_v7();
+                let projects = HashSet::from([project]);
+                // Populate demand before workers join; this probe does not measure enqueue broadcasts.
+                for _ in 0..backlog {
+                    let build = DerivationBuildId::now_v7();
+                    scheduler
+                        .enqueue_build_job(
+                            crate::jobs::build_job_key(build),
+                            build_job(EvaluationId::now_v7(), project, build),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let mut workers = Vec::new();
+                let report = WorkerHealth {
+                    checks: (0..check_count)
+                        .map(|index| WorkerHealthCheck {
+                            name: format!("check-{index}"),
+                            status: WorkerCheckStatus::Passed,
+                            healthy: true,
+                        })
+                        .collect(),
+                    valid_for_secs: 86_400,
+                };
+                for index in 0..worker_count {
+                    let id = format!("fleet-{index}");
+                    let session = port().0;
+                    scheduler
+                        .reattach_worker_with_readiness(
+                            &id,
+                            GradientCapabilities {
+                                build: true,
+                                ..Default::default()
+                            },
+                            projects.clone(),
+                            Arc::clone(&session),
+                            vec![],
+                            false,
+                            check_count > 0,
+                        )
+                        .await
+                        .unwrap();
+                    scheduler
+                        .update_worker_capabilities(
+                            &id,
+                            gradient_pool::WorkerProfile {
+                                architectures: vec!["x86_64-linux".into()],
+                                max_concurrent_builds: 2,
+                                cpu_count: 8,
+                                ram_total_mb: 32_000,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    if check_count > 0 {
+                        scheduler
+                            .update_worker_health(&id, Arc::clone(&session), report.clone())
+                            .await
+                            .unwrap();
+                    }
+                    workers.push((id, session));
+                }
+                let setup = started.elapsed();
+                let started = Instant::now();
+                let rounds = 5;
+                if check_count > 0 {
+                    for _ in 0..rounds {
+                        for (id, session) in &workers {
+                            scheduler
+                                .update_worker_health(id, Arc::clone(session), report.clone())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                let reports = started.elapsed();
+                let limits = crate::capacity::BuildCapacityLimits {
+                    builds: 128,
+                    workers: worker_count,
+                    scanned_jobs: usize::MAX,
+                    scanned_workers: usize::MAX,
+                    assigned_jobs_per_worker: 1_024,
+                };
+                let started = Instant::now();
+                for _ in 0..rounds {
+                    let assessment = scheduler
+                        .assess_build_capacity_with_limits(projects.clone(), vec![], limits)
+                        .await
+                        .unwrap();
+                    assert_eq!(assessment.snapshot.total_ready_builds, backlog);
+                    assert_eq!(assessment.snapshot.builds.len(), 128);
+                    assert_eq!(assessment.snapshot.workers.len(), worker_count);
+                    assert_eq!(
+                        assessment
+                            .snapshot
+                            .workers
+                            .iter()
+                            .map(|worker| worker.free_slots)
+                            .sum::<u32>(),
+                        u32::try_from(worker_count * 2).unwrap()
+                    );
+                }
+                let captures = started.elapsed();
+                if check_count > 0 {
+                    let mut failed = report.clone();
+                    failed.checks[0].healthy = false;
+                    failed.checks[0].status = WorkerCheckStatus::Failed;
+                    for (index, (id, session)) in workers.iter().enumerate() {
+                        if index % 2 == 0 {
+                            scheduler
+                                .update_worker_health(id, Arc::clone(session), failed.clone())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    let assessment = scheduler
+                        .assess_build_capacity_with_limits(projects.clone(), vec![], limits)
+                        .await
+                        .unwrap();
+                    assert_eq!(assessment.snapshot.workers.len(), worker_count / 2);
+                    assert_eq!(assessment.snapshot.total_ready_builds, backlog);
+                    for (index, (id, session)) in workers.iter().enumerate() {
+                        if index % 2 == 0 {
+                            scheduler
+                                .update_worker_health(id, Arc::clone(session), report.clone())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    let assessment = scheduler
+                        .assess_build_capacity_with_limits(projects, vec![], limits)
+                        .await
+                        .unwrap();
+                    assert_eq!(assessment.snapshot.workers.len(), worker_count);
+                    assert_eq!(assessment.snapshot.total_ready_builds, backlog);
+                }
+                println!(
+                    "scope=scheduler_actor mock_db=true workers={worker_count} \
+                     backlog={backlog} checks={check_count} setup_ms={:.1} \
+                     report_us={:.2} capture_ms={:.2}",
+                    setup.as_secs_f64() * 1_000.0,
+                    if check_count == 0 {
+                        0.0
+                    } else {
+                        reports.as_secs_f64() * 1_000_000.0 / (worker_count * rounds) as f64
+                    },
+                    captures.as_secs_f64() * 1_000.0 / rounds as f64,
+                );
+                actor.stop_and_wait(None, None).await.unwrap();
+                assert!(
+                    state
+                        .shutdown
+                        .cancel_and_drain(std::time::Duration::from_secs(5))
+                        .await
+                );
+            }
+        }
+    }
+
     fn assigned_build(core: &mut SchedulerCore, worker: &str) -> Option<String> {
         match core.assign(worker, &JobKind::Build, &InstanceContext::default()) {
             AssignOutcome::Assigned(a) => Some(a.job_id().to_owned()),

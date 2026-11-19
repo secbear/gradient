@@ -77,12 +77,16 @@ fn blocking_repair_candidates() -> String {
 
 crate::sql_fn! {
     FETCHABLE_REPAIR_CANDIDATES = fetchable_repair_candidates,
-        params = [DerivationIds(64)],
-        tier = Sweep;
+        params = [DerivationIds(250_000)],
+        tier = Sweep,
+        budget = crate::sql::Budget::sweep().buffers(4_000_000)
+            .because("a 235k-row cache-backed scope measured 3.3M buffers for output checks");
 
     BLOCKING_REPAIR_CANDIDATES = blocking_repair_candidates,
-        params = [DerivationIds(64)],
-        tier = Sweep;
+        params = [DerivationIds(250_000)],
+        tier = Sweep,
+        budget = crate::sql::Budget::sweep().buffers(15_000_000)
+            .because("a 235k-row, 1.88M-edge scope measured 12.8M buffers for dependency checks");
 }
 
 #[derive(Debug, Default)]

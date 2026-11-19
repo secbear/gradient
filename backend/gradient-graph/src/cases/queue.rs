@@ -21,7 +21,13 @@ async fn consistency_candidates_repair_flags_and_counters_before_queueing() {
     case.override_sb(B, |row| row.fetchable = false).await;
     case.override_sb(A, |row| row.blocking_deps = 9).await;
 
-    let report = case.drift().await;
+    let report = case
+        .graph
+        .transition(Transition::ConsistencyCheck)
+        .await
+        .expect("the actor repairs the graph")
+        .consistency
+        .expect("consistency report");
     assert_eq!(report.counter_drift, 2);
     assert!(case.sb(B).await.fetchable);
     assert_eq!(
@@ -29,6 +35,38 @@ async fn consistency_candidates_repair_flags_and_counters_before_queueing() {
         (BuildStatus::Queued, 0)
     );
     case.zero_drift("the repaired candidates").await;
+    case.finish().await;
+}
+
+#[tokio::test]
+async fn consistency_candidates_repair_multiple_chunks_in_the_actor_transaction() {
+    let case = Case::start(shape()).await;
+    case.db
+        .execute(
+            "INSERT INTO derivation (id, created_at, architecture, hash, name, walked) \
+             SELECT md5('candidate-' || i)::uuid, now(), 'x86_64-linux', \
+                    md5(i::text), 'candidate-' || i, true \
+             FROM generate_series(1, 1101) i; \
+             INSERT INTO derivation_build (id, derivation, created_at, updated_at, \
+                                           wanted, blocking_deps) \
+             SELECT md5('build-' || i)::uuid, md5('candidate-' || i)::uuid, \
+                    now(), now(), false, 9 FROM generate_series(1, 1101) i;",
+        )
+        .await;
+    let report = case
+        .graph
+        .transition(Transition::ConsistencyCheck)
+        .await
+        .expect("the actor repairs all chunks")
+        .consistency
+        .expect("consistency report");
+    assert_eq!(report.counter_drift, 1101);
+    assert_eq!(
+        case.db
+            .texts("SELECT count(*)::text FROM derivation_build WHERE blocking_deps <> 0")
+            .await,
+        ["0"]
+    );
     case.finish().await;
 }
 

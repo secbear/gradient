@@ -290,6 +290,8 @@ mod tests {
             architecture: "aarch64-linux".into(),
             required_features: vec![],
             build_count: 1,
+            build: true,
+            network: false,
         };
         let parked = MEvaluation {
             status: EvaluationStatus::Waiting,

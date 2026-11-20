@@ -22,6 +22,39 @@ function render(reason: WaitingReason, access: WaitingAccess, banner = false) {
 }
 
 describe('WaitingNoticeComponent', () => {
+  it.each([false, true])('renders repeated transfer labels with banner=%s', (banner) => {
+    const warnings = vi.spyOn(console, 'warn');
+    const requirement = { architecture: 'x86_64-linux', required_features: ['kvm'], build_count: 1 };
+    const reason: WaitingReason = {
+      kind: 'workers',
+      unmet: [
+        requirement,
+        { ...requirement, build: true, network: true },
+        { ...requirement, build: false, network: true },
+        { ...requirement, architecture: 'aarch64-linux', build: false, network: true },
+      ],
+      connected_workers: 0,
+      available_architectures: [],
+    };
+    const { fixture, root } = render(reason, {
+      manageWorkers: true, manageSubscriptions: false, trigger: false, superuser: false,
+    }, banner);
+    const rows = () => Array.from(root.querySelectorAll('.waiting-requirements li'));
+    const expected = [
+      'x86_64-linux with feature kvm - 1 build',
+      'x86_64-linux with feature kvm with network - 1 build',
+      'network transfer - 1 transfer',
+      'network transfer - 1 transfer',
+    ];
+    expect(rows().map(row => row.textContent?.trim())).toEqual(expected);
+
+    fixture.componentRef.setInput('reason', { ...reason, unmet: [...reason.unmet].reverse() });
+    fixture.detectChanges();
+    expect(rows().map(row => row.textContent?.trim())).toEqual([...expected].reverse());
+    expect(warnings).not.toHaveBeenCalled();
+    warnings.mockRestore();
+  });
+
   it('links a project admin straight to the page that fixes the wait', () => {
     const { root } = render({ kind: 'no_cache' }, { manageWorkers: true, manageSubscriptions: true, trigger: true, superuser: false });
     expect(root.textContent).toContain('No writable cache');

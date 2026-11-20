@@ -149,6 +149,25 @@ impl BuildabilityChecker {
             .unwrap_or_default()
     }
 
+    fn requirement(&self, build: &MDerivationBuild, drv: &MDerivation) -> UnmetRequirement {
+        let kind = decide_build_spec_kind(
+            build.cache_available,
+            &drv.architecture,
+            drv.is_fixed_output,
+        );
+        UnmetRequirement {
+            architecture: drv.architecture.clone(),
+            required_features: self
+                .required_features_for(&build.derivation)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            build_count: 1,
+            build: kind == BuildSpecKind::Build,
+            network: build_needs_network(kind, drv.is_fixed_output),
+        }
+    }
+
     pub(crate) fn unbuildable_imports(
         &self,
         imports: &[MDerivationBuild],
@@ -159,20 +178,7 @@ impl BuildabilityChecker {
             .filter(|b| BuildStatus::PENDING.contains(&b.status))
             .filter_map(|b| {
                 let drv = self.drv_by_id.get(&b.derivation)?;
-                (!self.runnable(b, drv, worker_caps)).then(|| {
-                    (
-                        b.id,
-                        UnmetRequirement {
-                            architecture: drv.architecture.clone(),
-                            required_features: self
-                                .required_features_for(&b.derivation)
-                                .into_iter()
-                                .map(str::to_owned)
-                                .collect(),
-                            build_count: 1,
-                        },
-                    )
-                })
+                (!self.runnable(b, drv, worker_caps)).then(|| (b.id, self.requirement(b, drv)))
             })
             .collect()
     }
@@ -182,7 +188,7 @@ impl BuildabilityChecker {
         shared_builds: &[MDerivationBuild],
         worker_caps: &[BuildWorkerCaps],
     ) -> WaitingReason {
-        let mut grouped: BTreeMap<(String, Vec<String>), u32> = BTreeMap::new();
+        let mut grouped: BTreeMap<(String, Vec<String>, bool, bool), u32> = BTreeMap::new();
         for a in shared_builds {
             let Some(drv) = self.drv_by_id.get(&a.derivation) else {
                 continue;
@@ -190,23 +196,28 @@ impl BuildabilityChecker {
             if self.runnable(a, drv, worker_caps) {
                 continue;
             }
-            let required_owned: Vec<String> = self
-                .required_features_for(&a.derivation)
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
+            let requirement = self.requirement(a, drv);
             *grouped
-                .entry((drv.architecture.clone(), required_owned))
+                .entry((
+                    requirement.architecture,
+                    requirement.required_features,
+                    requirement.build,
+                    requirement.network,
+                ))
                 .or_default() += 1;
         }
 
         let unmet: Vec<UnmetRequirement> = grouped
             .into_iter()
             .map(
-                |((architecture, required_features), build_count)| UnmetRequirement {
-                    architecture,
-                    required_features,
-                    build_count,
+                |((architecture, required_features, build, network), build_count)| {
+                    UnmetRequirement {
+                        architecture,
+                        required_features,
+                        build_count,
+                        build,
+                        network,
+                    }
                 },
             )
             .collect();
@@ -494,8 +505,12 @@ mod tests {
         let eval_id = EvaluationId::now_v7();
         let d = drv(DerivationId::now_v7(), "aarch64-linux");
         let mut build = cache_available_build(d.id, eval_id);
-        build.cache_available = false;
         let checker = checker_with(vec![d], vec![]);
+        let cached = checker.compute_waiting_reason(std::slice::from_ref(&build), &[]);
+        let (unmet, _, _) = workers_view(&cached);
+        assert!(!unmet[0].build);
+        assert!(unmet[0].network);
+        build.cache_available = false;
 
         let caps: Vec<BuildWorkerCaps> = vec![builder("x86_64-linux", true)];
         let builds = [build];
@@ -504,6 +519,8 @@ mod tests {
         let (unmet, _, _) = workers_view(&reason);
         assert_eq!(unmet.len(), 1);
         assert_eq!(unmet[0].architecture, "aarch64-linux");
+        assert!(unmet[0].build);
+        assert!(!unmet[0].network);
     }
 
     fn builder(architecture: &str, network: bool) -> BuildWorkerCaps {
@@ -537,6 +554,36 @@ mod tests {
     }
 
     #[test]
+    fn unmet_requirements_preserve_the_job_capabilities() {
+        for (architecture, fixed_output, cached, build, network) in [
+            ("builtin", true, false, false, true),
+            ("aarch64-linux", false, true, false, true),
+            ("x86_64-linux", true, false, true, true),
+            ("builtin", false, false, true, false),
+            ("x86_64-linux", false, false, true, false),
+        ] {
+            let mut d = drv(DerivationId::now_v7(), architecture);
+            d.is_fixed_output = fixed_output;
+            let mut b = build_for(d.id, EvaluationId::now_v7());
+            b.cache_available = cached;
+            let checker = checker_with(vec![d], vec![(b.derivation, FeatureId::now_v7(), "kvm")]);
+            let reason = checker.compute_waiting_reason(std::slice::from_ref(&b), &[]);
+            let encoded = reason.to_json();
+            assert_eq!(encoded["unmet"][0]["build"], build, "{architecture}");
+            assert_eq!(encoded["unmet"][0]["network"], network, "{architecture}");
+            assert_eq!(
+                encoded["unmet"][0]["required_features"],
+                serde_json::json!(["kvm"])
+            );
+
+            let imports = checker.unbuildable_imports(&[b], &[]);
+            let encoded = serde_json::to_value(&imports[0].1).unwrap();
+            assert_eq!(encoded["build"], build, "import {architecture}");
+            assert_eq!(encoded["network"], network, "import {architecture}");
+        }
+    }
+
+    #[test]
     fn a_build_needs_a_build_worker() {
         let mut fod = drv(DerivationId::now_v7(), "x86_64-linux");
         fod.is_fixed_output = true;
@@ -552,8 +599,8 @@ mod tests {
         let (unmet, connected_workers, available_architectures) = workers_view(&reason);
         assert_eq!(
             unmet.len(),
-            1,
-            "both builds still need a builder: {unmet:?}"
+            2,
+            "fixed-output and ordinary builds need different capabilities: {unmet:?}"
         );
         assert_eq!(connected_workers, 1);
         assert!(available_architectures.is_empty());

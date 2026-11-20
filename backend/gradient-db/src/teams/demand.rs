@@ -51,7 +51,7 @@ pub async fn team_demand(
 
 fn aggregate(reasons: impl IntoIterator<Item = WaitingReason>) -> TeamDemand {
     let mut demand = TeamDemand::default();
-    let mut builds: BTreeMap<(String, Vec<String>), u32> = BTreeMap::new();
+    let mut builds: BTreeMap<(String, Vec<String>, bool, bool), u32> = BTreeMap::new();
     for reason in reasons {
         match reason {
             WaitingReason::Workers { unmet, .. } => {
@@ -59,7 +59,12 @@ fn aggregate(reasons: impl IntoIterator<Item = WaitingReason>) -> TeamDemand {
                     let mut features = requirement.required_features;
                     features.sort();
                     *builds
-                        .entry((requirement.architecture, features))
+                        .entry((
+                            requirement.architecture,
+                            features,
+                            requirement.build,
+                            requirement.network,
+                        ))
                         .or_default() += requirement.build_count;
                 }
             }
@@ -75,10 +80,12 @@ fn aggregate(reasons: impl IntoIterator<Item = WaitingReason>) -> TeamDemand {
     demand.builds = builds
         .into_iter()
         .map(
-            |((architecture, required_features), build_count)| UnmetRequirement {
+            |((architecture, required_features, build, network), build_count)| UnmetRequirement {
                 architecture,
                 required_features,
                 build_count,
+                build,
+                network,
             },
         )
         .collect();
@@ -111,6 +118,8 @@ mod tests {
             architecture: architecture.into(),
             required_features: features.iter().map(|f| f.to_string()).collect(),
             build_count,
+            build: true,
+            network: false,
         }
     }
 
@@ -146,6 +155,31 @@ mod tests {
                 unmet("aarch64-darwin", &[], 1),
                 unmet("x86_64-linux", &["big", "kvm"], 5),
             ]
+        );
+    }
+
+    #[test]
+    fn keeps_build_and_network_requirements_separate() {
+        let reason = WaitingReason::from_json(&serde_json::json!({
+            "kind": "workers",
+            "connected_workers": 0,
+            "available_architectures": [],
+            "unmet": [
+                {"architecture": "builtin", "required_features": [], "build_count": 2, "build": false, "network": true},
+                {"architecture": "builtin", "required_features": [], "build_count": 3, "build": true, "network": false},
+                {"architecture": "builtin", "required_features": [], "build_count": 4, "build": true, "network": true}
+            ]
+        }))
+        .expect("waiting reason");
+
+        let demand = aggregate([reason]);
+        assert_eq!(
+            demand
+                .builds
+                .iter()
+                .map(|r| (r.build, r.network, r.build_count))
+                .collect::<Vec<_>>(),
+            [(false, true, 2), (true, false, 3), (true, true, 4)]
         );
     }
 

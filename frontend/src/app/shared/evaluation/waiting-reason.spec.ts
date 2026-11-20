@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import type { WaitingReason } from '@core/models';
-import { type WaitingAccess, explainWaiting, waitingReasonText } from './waiting-reason';
+import type { UnmetRequirement, WaitingReason } from '@core/models';
+import { type WaitingAccess, explainWaiting, unmetRequirementLabel, waitingReasonText } from './waiting-reason';
 
 const ADMIN: WaitingAccess = { manageWorkers: true, manageSubscriptions: true, trigger: true, superuser: false };
 const VIEWER: WaitingAccess = { manageWorkers: false, manageSubscriptions: false, trigger: false, superuser: false };
@@ -15,6 +15,33 @@ function linkOf(reason: WaitingReason | null, access: WaitingAccess): string | n
   const action = explainWaiting(reason, 'acme', access).action;
   return action?.kind === 'link' ? String(action.link) : null;
 }
+
+describe('unmetRequirementLabel', () => {
+  const requirement: UnmetRequirement = {
+    architecture: 'x86_64-linux', required_features: ['kvm'], build_count: 1,
+  };
+
+  it.each([
+    { name: 'legacy build', req: requirement, label: 'x86_64-linux with feature kvm - 1 build' },
+    {
+      name: 'build with network',
+      req: { ...requirement, build: true, network: true },
+      label: 'x86_64-linux with feature kvm with network - 1 build',
+    },
+    {
+      name: 'network transfer',
+      req: { ...requirement, build: false, network: true },
+      label: 'network transfer - 1 transfer',
+    },
+    {
+      name: 'transfers without a network requirement',
+      req: { ...requirement, build: false, build_count: 2 },
+      label: 'transfer - 2 transfers',
+    },
+  ])('labels $name requirements', ({ req, label }) => {
+    expect(unmetRequirementLabel(req)).toBe(label);
+  });
+});
 
 describe('explainWaiting', () => {
   it('sends a project admin to the cache subscriptions when no cache is configured', () => {

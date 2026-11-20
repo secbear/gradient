@@ -43,11 +43,25 @@ async fn admin_reads_demand() {
             includes_workers: true,
             ..Default::default()
         }]])
-        .append_query_results([vec![evaluation::Model {
-            status: EvaluationStatus::Waiting,
-            waiting_reason: Some(WaitingReason::eval_workers(EvalCapability::Eval, 0).to_json()),
-            ..Default::default()
-        }]]);
+        .append_query_results([vec![
+            evaluation::Model {
+                status: EvaluationStatus::Waiting,
+                waiting_reason: Some(WaitingReason::eval_workers(EvalCapability::Eval, 0).to_json()),
+                ..Default::default()
+            },
+            evaluation::Model {
+                status: EvaluationStatus::Waiting,
+                waiting_reason: Some(serde_json::json!({
+                    "kind": "workers", "connected_workers": 0, "available_architectures": [],
+                    "unmet": [
+                        {"architecture": "x86_64-linux", "required_features": [], "build_count": 1},
+                        {"architecture": "builtin", "required_features": [], "build_count": 2, "build": false, "network": true},
+                        {"architecture": "x86_64-linux", "required_features": [], "build_count": 3, "build": true, "network": true}
+                    ]
+                })),
+                ..Default::default()
+            },
+        ]]);
     let server = make_test_server(db.into_connection());
 
     let res = server
@@ -60,5 +74,12 @@ async fn admin_reads_demand() {
     assert_eq!(body["message"]["eval"], 1);
     assert_eq!(body["message"]["network"], 0);
     assert_eq!(body["message"]["secrets"], 0);
-    assert_eq!(body["message"]["builds"], serde_json::json!([]));
+    assert_eq!(
+        body["message"]["builds"],
+        serde_json::json!([
+            {"architecture": "builtin", "required_features": [], "build_count": 2, "build": false, "network": true},
+            {"architecture": "x86_64-linux", "required_features": [], "build_count": 1, "build": true, "network": false},
+            {"architecture": "x86_64-linux", "required_features": [], "build_count": 3, "build": true, "network": true}
+        ])
+    );
 }

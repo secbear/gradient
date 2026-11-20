@@ -380,6 +380,8 @@ mod tests {
                     architecture: "x86_64-linux".into(),
                     required_features: Vec::new(),
                     build_count: 1,
+                    build: true,
+                    network: false,
                 }],
                 0,
                 Vec::new(),

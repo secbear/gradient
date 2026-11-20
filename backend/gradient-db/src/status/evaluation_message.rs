@@ -105,6 +105,8 @@ mod tests {
             architecture: architecture.into(),
             required_features: features.iter().map(|f| f.to_string()).collect(),
             build_count,
+            build: true,
+            network: false,
         }
     }
 

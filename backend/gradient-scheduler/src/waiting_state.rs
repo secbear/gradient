@@ -1030,6 +1030,8 @@ mod tests {
                 architecture: "x86_64-linux".into(),
                 required_features: vec!["kvm".into()],
                 build_count: connected_workers + 1,
+                build: true,
+                network: false,
             }],
             connected_workers,
             vec![],

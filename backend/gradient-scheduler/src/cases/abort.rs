@@ -1286,6 +1286,8 @@ async fn a16_a_waiting_evaluation_with_unmet_systems_is_aborted_unless_the_task_
             architecture: ARM.into(),
             required_features: Vec::new(),
             build_count: 1,
+            build: true,
+            network: false,
         }],
         1,
         vec![X86.into()],

@@ -133,13 +133,30 @@ pub struct UnmetRequirement {
     pub architecture: String,
     pub required_features: Vec<String>,
     pub build_count: u32,
+    /// Whether the job requires a Nix build worker.
+    #[serde(default = "default_true")]
+    pub build: bool,
+    /// Whether the job requires a network-enabled worker.
+    #[serde(default)]
+    pub network: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl std::fmt::Display for UnmetRequirement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.architecture)?;
-        if !self.required_features.is_empty() {
+        f.write_str(if self.build {
+            &self.architecture
+        } else {
+            "network"
+        })?;
+        if self.build && !self.required_features.is_empty() {
             write!(f, " with features {}", self.required_features.join(", "))?;
+        }
+        if self.build && self.network {
+            f.write_str(" with network")?;
         }
 
         write!(f, " ({} builds)", self.build_count)
@@ -217,7 +234,13 @@ impl WaitingReason {
                     .map(|u| {
                         let mut features = u.required_features.clone();
                         features.sort();
-                        format!("{}[{}]", u.architecture, features.join(","))
+                        format!(
+                            "{}[{}]:build={}:network={}",
+                            u.architecture,
+                            features.join(","),
+                            u.build,
+                            u.network
+                        )
                     })
                     .collect();
                 gaps.sort();
@@ -257,6 +280,8 @@ mod tests {
             architecture: arch.to_owned(),
             required_features: features.iter().map(|f| f.to_string()).collect(),
             build_count,
+            build: true,
+            network: false,
         };
         let a = WaitingReason::workers(
             vec![
@@ -277,6 +302,52 @@ mod tests {
         assert_eq!(a.worker_gap(), b.worker_gap());
         assert_eq!(WaitingReason::workers(vec![], 1, vec![]).worker_gap(), None);
         assert_eq!(WaitingReason::Draining.worker_gap(), None);
+    }
+
+    #[test]
+    fn a_workers_row_stored_before_capabilities_still_decodes() {
+        let stored = serde_json::json!({
+            "kind": "workers",
+            "unmet": [{"architecture": "builtin", "required_features": [], "build_count": 1}],
+            "connected_workers": 0,
+            "available_architectures": [],
+        });
+        let Some(WaitingReason::Workers { unmet, .. }) = WaitingReason::from_json(&stored) else {
+            panic!("the stored row decodes");
+        };
+        assert!(unmet[0].build);
+        assert!(!unmet[0].network);
+    }
+
+    #[test]
+    fn a_worker_gap_changes_when_required_capabilities_change() {
+        let requirement = UnmetRequirement {
+            architecture: "builtin".into(),
+            required_features: vec![],
+            build_count: 1,
+            build: true,
+            network: false,
+        };
+        let plain = WaitingReason::workers(vec![requirement.clone()], 0, vec![]);
+        let download = WaitingReason::workers(
+            vec![UnmetRequirement {
+                build: false,
+                network: true,
+                ..requirement.clone()
+            }],
+            0,
+            vec![],
+        );
+        let fixed_output = WaitingReason::workers(
+            vec![UnmetRequirement {
+                network: true,
+                ..requirement
+            }],
+            0,
+            vec![],
+        );
+        assert_ne!(plain.worker_gap(), download.worker_gap());
+        assert_ne!(plain.worker_gap(), fixed_output.worker_gap());
     }
 
     #[test]

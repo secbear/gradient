@@ -23033,6 +23033,12 @@ components:
           type: integer
           format: int32
           minimum: 0
+        build:
+          type: boolean
+          description: Whether the job requires a Nix build worker.
+        network:
+          type: boolean
+          description: Whether the job requires a network-enabled worker.
     UpdateActionRequest:
       type: object
       properties:

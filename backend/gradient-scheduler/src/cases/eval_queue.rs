@@ -11,6 +11,7 @@ use gradient_entity::build_attempt::{AttemptFailureReason, AttemptOutcome};
 use gradient_entity::commit;
 use gradient_entity::evaluation::{EvaluationKind, EvaluationStatus};
 use gradient_entity::ids::EvaluationId;
+use gradient_entity::{team, team_project};
 use gradient_fixtures::shape::{Shape, shape};
 use gradient_pool::session_port::SessionSignal;
 use gradient_types::vec_to_hex;
@@ -18,11 +19,12 @@ use gradient_types::waiting_reason::{EvalCapability, UnmetRequirement, WaitingRe
 use gradient_wire::types::{
     FlakeInputOverride, FlakeJob, FlakeSource, FlakeStep, InputUpdateSpec, JobKind,
 };
+use sea_orm::{EntityTrait, IntoActiveModel};
 
 use super::{
     A, A_OUT, ARM, B, B_OUT, C, C_OUT, CaseShapes, REPOSITORY, S_OUT, SchedulerCase, X86, ago,
-    attr_of, drv_nar, eval_key, store_path, w_all, w_build, w_eval, w_network, w_network_eval,
-    w_network_secrets,
+    attr_of, drv_nar, eval_key, store_path, w_all, w_build, w_eval, w_network, w_network_build,
+    w_network_eval, w_network_secrets,
 };
 
 const SSH_REPOSITORY: &str = "git+ssh://git@example.invalid/repo.git";
@@ -474,6 +476,8 @@ async fn q11_a_building_evaluation_without_a_fitting_worker_waits_until_one_fits
         architecture: ARM.into(),
         required_features: vec!["big-parallel".into()],
         build_count: 1,
+        build: true,
+        network: false,
     };
     assert_eq!(
         waiting_state(&case, e1).await,
@@ -504,6 +508,91 @@ async fn q11_a_building_evaluation_without_a_fitting_worker_waits_until_one_fits
     case.check("step 3").await;
 
     case.finish().await;
+}
+
+#[tokio::test]
+async fn q11b_persisted_demand_preserves_build_and_network_requirements_until_recovery() {
+    for (architecture, fixed_output, cached, build, network) in [
+        ("builtin", true, false, false, true),
+        (ARM, false, true, false, true),
+        (X86, true, false, true, true),
+        (X86, false, false, true, false),
+    ] {
+        let evaluation = EvaluationId::now_v7();
+        let case = SchedulerCase::start(
+            shape()
+                .one(evaluation, A, A_OUT)
+                .system(architecture)
+                .feature("kvm")
+                .derivation_option(|drv| drv.is_fixed_output = fixed_output)
+                .shared_build_option(|shared| shared.cache_available = cached),
+        )
+        .await;
+        let owner = gradient_fixtures::rows::team();
+        team::Entity::insert(owner.clone().into_active_model())
+            .exec(&case.ctx.worker_db)
+            .await
+            .expect("insert team");
+        team_project::Entity::insert(
+            team_project::Model {
+                id: gradient_types::TeamProjectId::now_v7(),
+                team: owner.id,
+                project: case.db.project_of(evaluation).await,
+                includes_workers: true,
+                ..Default::default()
+            }
+            .into_active_model(),
+        )
+        .exec(&case.ctx.worker_db)
+        .await
+        .expect("grant team workers to project");
+        case.connect(W1, w_eval(), &[]).await;
+        case.admit_startable_moves().await;
+        case.refresh_waiting_state().await;
+
+        let (status, reason) = waiting_state(&case, evaluation).await;
+        assert_eq!(status, EvaluationStatus::Waiting);
+        let expected = serde_json::json!([{
+            "architecture": architecture,
+            "required_features": ["kvm"],
+            "build_count": 1,
+            "build": build,
+            "network": network,
+        }]);
+        assert_eq!(reason.expect("waiting reason").to_json()["unmet"], expected);
+        let demand = gradient_db::teams::demand::team_demand(&case.ctx.worker_db, owner.id, None)
+            .await
+            .expect("read persisted demand");
+        assert_eq!(
+            serde_json::to_value(&demand.builds).expect("encode demand"),
+            expected
+        );
+        case.check("persisted capability demand").await;
+
+        let worker = if build {
+            if network {
+                w_network_build()
+            } else {
+                w_build()
+            }
+            .arch(&[architecture])
+            .features(&["kvm"])
+        } else {
+            w_network()
+        };
+        case.connect(W2, worker, &[]).await;
+        case.refresh_waiting_state().await;
+        assert_eq!(
+            waiting_state(&case, evaluation).await,
+            (EvaluationStatus::Building, None),
+        );
+        let demand = gradient_db::teams::demand::team_demand(&case.ctx.worker_db, owner.id, None)
+            .await
+            .expect("read recovered demand");
+        assert!(demand.builds.is_empty());
+        case.check("eligible worker recovers demand").await;
+        case.finish().await;
+    }
 }
 
 #[tokio::test]

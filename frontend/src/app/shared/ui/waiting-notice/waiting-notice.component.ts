@@ -33,7 +33,7 @@ import { type WaitingAccess, explainWaiting } from '@shared/evaluation';
     <ng-template #details>
       @if (e.requirements.length) {
         <ul class="waiting-requirements">
-          @for (requirement of e.requirements; track requirement) { <li>{{ requirement }}</li> }
+          @for (requirement of e.requirements; track $index) { <li>{{ requirement }}</li> }
         </ul>
       }
       @if (e.action || pendingJobLink()) {

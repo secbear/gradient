@@ -2982,6 +2982,8 @@ export interface UnmetRequirement {
   architecture: string;
   required_features: string[];
   build_count: number;
+  build?: boolean;
+  network?: boolean;
 }
 
 export interface UpdateActionRequest {

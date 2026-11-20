@@ -79,10 +79,14 @@ function cachesAction(project: string, label: string): WaitingAction {
 }
 
 export function unmetRequirementLabel(req: UnmetRequirement): string {
+  const unit = req.build === false ? 'transfer' : 'build';
+  const count = plural(req.build_count, unit);
+  if (req.build === false) return `${req.network ? 'network ' : ''}transfer - ${count}`;
   const features = req.required_features.length
     ? ` with feature${req.required_features.length === 1 ? '' : 's'} ${req.required_features.join(', ')}`
     : '';
-  return `${req.architecture}${features} - ${plural(req.build_count, 'build')}`;
+  const network = req.network ? ' with network' : '';
+  return `${req.architecture}${features}${network} - ${count}`;
 }
 
 // All waiting reasons map to an explanation and a next action for the viewer in one place. The task, log, running-jobs and board pages all use that mapping.

@@ -11,15 +11,17 @@ use crate::helpers::{OptionExt, ok_json};
 use crate::refusal::SharedRefusal;
 use crate::resource::Resource;
 use crate::scope::{AdminWithApiKey, TeamScope, can};
+use anyhow::Context;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::NaiveDateTime;
+use gradient_ci::actions::{decrypt_action_secret, encrypt_action_secret};
 use gradient_scheduler::Scheduler;
 use gradient_scheduler::capacity::{
-    BuildCapacityAssessment, BuildCapacityLimits, BuildCapacityProfile, BuildProfileAssessment,
-    BuildResourceAssessment,
+    BuildCapacityAssessment, BuildCapacityCursor, BuildCapacityLimits, BuildCapacityProfile,
+    BuildCapacitySnapshot, BuildProfileAssessment, BuildResourceAssessment,
 };
-use gradient_types::ProjectId;
+use gradient_types::{ProjectId, SecretBytes, TeamId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -75,6 +77,103 @@ pub struct CapacityAssessmentRequest {
     /// Include once-only RAM credit for a waiting build in the selected batch.
     #[serde(default)]
     pub include_waiting_builds: bool,
+    /// Request queue continuation; omit to retain the oldest-build assessment.
+    pub build_page: Option<CapacityBuildPageRequest>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityBuildPageRequest {
+    pub after: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CapacityBuildPage {
+    /// Ready ordinary builds beyond this page in the current scope.
+    pub remaining_ready_builds: usize,
+    /// Opaque continuation, or null when the current suffix is exhausted.
+    pub next: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityCursor {
+    kind: CapacityCursorKind,
+    team: TeamId,
+    projects: Vec<ProjectId>,
+    after: BuildCapacityCursor,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CapacityCursorKind {
+    BuildCapacityPageV1,
+}
+
+struct CapacityPageContext {
+    key: SecretBytes,
+    team: TeamId,
+    projects: Vec<ProjectId>,
+    after: Option<BuildCapacityCursor>,
+}
+
+impl CapacityPageContext {
+    fn read(
+        request: CapacityBuildPageRequest,
+        team: TeamId,
+        projects: HashSet<ProjectId>,
+        crypt_file: &str,
+    ) -> WebResult<Self> {
+        let key =
+            gradient_types::input::load_secret_bytes(crypt_file).map_err(cursor_unavailable)?;
+        let mut projects: Vec<_> = projects.into_iter().collect();
+        projects.sort_unstable();
+        let after = request
+            .after
+            .map(|encrypted| {
+                let plaintext = decrypt_action_secret(&encrypted, key.expose())
+                    .map_err(|_| TeamRefusal::InvalidCapacityCursor)?;
+                let cursor: CapacityCursor = serde_json::from_str(&plaintext)
+                    .map_err(|_| TeamRefusal::InvalidCapacityCursor)?;
+                if cursor.team != team || cursor.projects != projects {
+                    return Err(TeamRefusal::InvalidCapacityCursor.into());
+                }
+                Ok::<_, WebError>(cursor.after)
+            })
+            .transpose()?;
+        Ok(Self {
+            key,
+            team,
+            projects,
+            after,
+        })
+    }
+
+    fn response(&self, snapshot: &BuildCapacitySnapshot) -> WebResult<CapacityBuildPage> {
+        let next = snapshot
+            .builds
+            .last()
+            .filter(|_| snapshot.remaining_ready_builds > 0)
+            .map(|build| {
+                let cursor = CapacityCursor {
+                    kind: CapacityCursorKind::BuildCapacityPageV1,
+                    team: self.team,
+                    projects: self.projects.clone(),
+                    after: BuildCapacityCursor {
+                        ready_at: build.ready_at,
+                        build: build.id,
+                    },
+                };
+                let plaintext =
+                    serde_json::to_string(&cursor).context("serialize capacity cursor")?;
+                encrypt_action_secret(&plaintext, self.key.expose()).map_err(cursor_unavailable)
+            })
+            .transpose()?;
+        Ok(CapacityBuildPage {
+            remaining_ready_builds: snapshot.remaining_ready_builds,
+            next,
+        })
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -126,6 +225,8 @@ pub struct CapacityAssessmentResponse {
     pub builds: Vec<CapacityBuild>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tracked_workers: Vec<TrackedCapacityWorker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_page: Option<CapacityBuildPage>,
 }
 
 impl CapacityAssessmentResponse {
@@ -134,6 +235,7 @@ impl CapacityAssessmentResponse {
         profiles: Vec<BuildCapacityProfile>,
         tracked_profiles: Vec<BuildCapacityProfile>,
         include_waiting_builds: bool,
+        build_page: Option<CapacityBuildPage>,
     ) -> Self {
         let snapshot = &assessment.snapshot;
         let builds = snapshot
@@ -201,6 +303,7 @@ impl CapacityAssessmentResponse {
                     }
                 })
                 .collect(),
+            build_page,
         }
     }
 }
@@ -212,13 +315,18 @@ fn unavailable() -> WebError {
     )
 }
 
+fn cursor_unavailable(error: anyhow::Error) -> WebError {
+    tracing::warn!(error = %error, "capacity cursor unavailable");
+    unavailable()
+}
+
 #[utoipa::path(
     post,
     path = "/teams/{team}/workers/capacity-assessment",
     operation_id = "assessTeamBuildCapacity",
     tag = "teams",
     summary = "Assess local ordinary-build capacity",
-    description = "Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.\n\nReturns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.\n\nProspective profiles require unregistered UUIDs and planned build/network enable flags. Tracked profiles require active, build-enabled registrations owned by this team. Saved registration flags additionally restrict their network capability. A connected tracked worker never receives a starting-profile assessment, even when it has no scoped live-worker index. All profile fits remain conditional on valid worker tokens, project caches and matching advertised resources.\n\ninclude_waiting_builds adds once-only RAM credit for a waiting build in the selected batch. The credit is the native usable-budget difference, not raw reserved RAM. Fit does not imply a free slot. Unknown predictions remain distinct from fallback reservations. captured_at is not a metrics sample timestamp.",
+    description = "Needs Admin in the team. API keys must be pinned to this team and additionally need manageWorkers. Only projects granting the team its workers are assessed. This is one scheduler instance's resource snapshot, not placement or a reservation. Builds and live workers use response-local indexes.\n\nReturns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.\n\nSet build_page to {} to request an opaque continuation, then pass build_page.next as build_page.after with the same team and resolved project scope. Each page captures fresh state and scans the bounded local queue; pages cannot be combined as one capacity snapshot. Bound page requests per planning cycle. Restart at the beginning when next is null or the scope changes. New work before the cursor appears on that next pass. remaining_ready_builds counts ready work beyond this page; total_ready_builds and builds_truncated still describe the full scoped backlog.\n\nProspective profiles require unregistered UUIDs and planned build/network enable flags. Tracked profiles require active, build-enabled registrations owned by this team. Saved registration flags additionally restrict their network capability. A connected tracked worker never receives a starting-profile assessment, even when it has no scoped live-worker index. All profile fits remain conditional on valid worker tokens, project caches and matching advertised resources.\n\ninclude_waiting_builds adds once-only RAM credit for a waiting build in the selected batch. The credit is the native usable-budget difference, not raw reserved RAM. Fit does not imply a free slot. Unknown predictions remain distinct from fallback reservations. captured_at is not a metrics sample timestamp.",
     params(TeamPath),
     request_body = CapacityAssessmentRequest,
     responses((status = OK, description = "OK", body = CapacityAssessmentResponse), WebError)
@@ -312,6 +420,7 @@ pub async fn post_team_capacity_assessment(
         tracked_profiles,
         body.include_waiting_builds,
         permit,
+        body.build_page.map(|page| (page, team.id)),
     )
     .await
 }
@@ -344,13 +453,24 @@ async fn assess_capacity(
     tracked_profiles: Vec<BuildCapacityProfile>,
     include_waiting_builds: bool,
     permit: OwnedSemaphorePermit,
+    page: Option<(CapacityBuildPageRequest, TeamId)>,
 ) -> WebResult<Response> {
     // The task owns admission even if the HTTP request is cancelled.
     let shutdown = scheduler.db.shutdown.clone();
     shutdown
         .spawn(async move {
+            let (page, permit) = if let Some((request, team)) = page {
+                let projects = projects.clone();
+                let crypt_file = scheduler.db.config.secrets.crypt_file.clone();
+                blocking_capacity_work(permit, move || {
+                    CapacityPageContext::read(request, team, projects, &crypt_file).map(Some)
+                })
+                .await?
+            } else {
+                (None, permit)
+            };
             let assessment = scheduler
-                .assess_build_capacity_with_tracked_workers(
+                .assess_build_capacity_page(
                     projects,
                     profiles.clone(),
                     tracked_profiles.clone(),
@@ -361,27 +481,45 @@ async fn assess_capacity(
                         scanned_workers: MAX_SCANNED_WORKERS,
                         assigned_jobs_per_worker: MAX_ASSIGNED_JOBS_PER_WORKER,
                     },
+                    page.as_ref().and_then(|page| page.after),
                 )
                 .await
                 .map_err(|err| {
                     tracing::warn!(error = %err, "capacity snapshot unavailable");
                     unavailable()
                 })?;
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                ok_json(CapacityAssessmentResponse::from_assessment(
-                    assessment,
-                    profiles,
-                    tracked_profiles,
-                    include_waiting_builds,
-                ))
-                .into_response()
+            let (response, _permit) = blocking_capacity_work(permit, move || {
+                let build_page = page
+                    .map(|page| page.response(&assessment.snapshot))
+                    .transpose()?;
+                Ok::<_, WebError>(
+                    ok_json(CapacityAssessmentResponse::from_assessment(
+                        assessment,
+                        profiles,
+                        tracked_profiles,
+                        include_waiting_builds,
+                        build_page,
+                    ))
+                    .into_response(),
+                )
             })
-            .await
-            .map_err(|err| WebError::Internal(err.into()))
+            .await?;
+            Ok(response)
         })
         .await
         .map_err(|err| WebError::Internal(err.into()))?
+}
+
+async fn blocking_capacity_work<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    work: impl FnOnce() -> WebResult<T> + Send + 'static,
+) -> WebResult<(T, OwnedSemaphorePermit)> {
+    tokio::task::spawn_blocking(move || {
+        let value = work()?;
+        Ok((value, permit))
+    })
+    .await
+    .map_err(|err| WebError::Internal(err.into()))?
 }
 
 #[cfg(test)]
@@ -406,21 +544,95 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_capacity_work_keeps_admission_until_assessment_finishes() {
-        let scheduler = Arc::new(Scheduler::new(TestState::new().build()));
+        for paged in [false, true] {
+            let key = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(key.path(), b"capacity-test-key-32-bytes-padding").unwrap();
+            let path = key.path().to_string_lossy().into_owned();
+            let state = TestState::new().config(move |config| config.secrets.crypt_file = path);
+            let scheduler = Arc::new(Scheduler::new(state.build()));
+            let admission = CapacityAssessmentAdmission::default();
+            let mut caller = Box::pin(assess_capacity(
+                Arc::clone(&scheduler),
+                HashSet::new(),
+                vec![],
+                vec![],
+                false,
+                admission.try_acquire().unwrap(),
+                paged.then_some((CapacityBuildPageRequest { after: None }, TeamId::now_v7())),
+            ));
+            assert!(futures::poll!(caller.as_mut()).is_pending());
+            drop(caller);
+            assert_eq!(admission.0.available_permits(), 1);
+            assert_eq!(scheduler.db.shutdown.pending(), 1);
+            let core = scheduler.spawn_core(None).await.unwrap();
+            let restored = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                Arc::clone(&admission.0).acquire_many_owned(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(restored);
+            core.stop_and_wait(None, None).await.unwrap();
+            assert!(
+                scheduler
+                    .db
+                    .shutdown
+                    .cancel_and_drain(std::time::Duration::from_secs(5))
+                    .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_cursor_crypto_keeps_admission_until_blocking_work_finishes() {
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key.path(), b"capacity-test-key-32-bytes-padding").unwrap();
+        let path = key.path().to_string_lossy().into_owned();
+        let team = TeamId::now_v7();
+        let after = BuildCapacityCursor {
+            ready_at: gradient_types::now(),
+            build: gradient_types::DerivationBuildId::now_v7(),
+        };
+        let cursor = serde_json::json!({
+            "kind": "build_capacity_page_v1",
+            "team": team,
+            "projects": [],
+            "after": {
+                "ready_at": after.ready_at,
+                "build": after.build
+            }
+        });
+        let encrypted =
+            encrypt_action_secret(&cursor.to_string(), &std::fs::read(key.path()).unwrap())
+                .unwrap();
         let admission = CapacityAssessmentAdmission::default();
-        let mut caller = Box::pin(assess_capacity(
-            Arc::clone(&scheduler),
-            HashSet::new(),
-            vec![],
-            vec![],
-            false,
+        let (started, working) = tokio::sync::oneshot::channel();
+        let (finished, decrypted) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut caller = Box::pin(blocking_capacity_work(
             admission.try_acquire().unwrap(),
+            move || {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+                let page = CapacityPageContext::read(
+                    CapacityBuildPageRequest {
+                        after: Some(encrypted),
+                    },
+                    team,
+                    HashSet::new(),
+                    &path,
+                )?;
+                finished.send(page.after).unwrap();
+                Ok(page)
+            },
         ));
         assert!(futures::poll!(caller.as_mut()).is_pending());
+        working.await.unwrap();
         drop(caller);
         assert_eq!(admission.0.available_permits(), 1);
-        assert_eq!(scheduler.db.shutdown.pending(), 1);
-        let core = scheduler.spawn_core(None).await.unwrap();
+        release.send(()).unwrap();
+        assert_eq!(decrypted.await.unwrap(), Some(after));
         let restored = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             Arc::clone(&admission.0).acquire_many_owned(2),
@@ -429,13 +641,6 @@ mod tests {
         .unwrap()
         .unwrap();
         drop(restored);
-        core.stop_and_wait(None, None).await.unwrap();
-        assert!(
-            scheduler
-                .db
-                .shutdown
-                .cancel_and_drain(std::time::Duration::from_secs(5))
-                .await
-        );
+        assert_eq!(admission.0.available_permits(), 2);
     }
 }

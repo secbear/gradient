@@ -168,6 +168,13 @@ pub struct ReadyBuild {
     pub estimate: BuildEstimate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildCapacityCursor {
+    pub ready_at: NaiveDateTime,
+    pub build: DerivationBuildId,
+}
+
 #[derive(Debug, Clone)]
 pub struct BuildCapacityWorker {
     pub id: String,
@@ -184,6 +191,8 @@ pub struct BuildCapacitySnapshot {
     pub server_draining: bool,
     pub builds: Vec<ReadyBuild>,
     pub total_ready_builds: usize,
+    /// Ready ordinary builds beyond the selected page.
+    pub remaining_ready_builds: usize,
     pub workers: Vec<BuildCapacityWorker>,
     /// Requested identities connected to this instance, independently of project eligibility.
     pub connected_workers: HashSet<String>,
@@ -314,6 +323,7 @@ mod tests {
             captured_at: gradient_types::now(),
             server_draining: false,
             total_ready_builds: 1,
+            remaining_ready_builds: 0,
             connected_workers: HashSet::new(),
             builds: vec![ReadyBuild {
                 id: DerivationBuildId::now_v7(),

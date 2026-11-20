@@ -1953,13 +1953,15 @@ impl JobTracker {
         projects: &HashSet<ProjectId>,
         limit: usize,
         scan_limit: usize,
-    ) -> anyhow::Result<(usize, Vec<crate::capacity::ReadyBuild>)> {
+        after: Option<crate::capacity::BuildCapacityCursor>,
+    ) -> anyhow::Result<(usize, usize, Vec<crate::capacity::ReadyBuild>)> {
         anyhow::ensure!(
             self.pending.capacity() <= scan_limit,
             "too many pending jobs to scan for a capacity assessment"
         );
         let mut oldest = BTreeMap::new();
         let mut total = 0;
+        let mut remaining = 0;
         for job in self.pending.values() {
             match job {
                 PendingJob::Build(build)
@@ -1968,6 +1970,10 @@ impl JobTracker {
                 {
                     total += 1;
                     let key = (build.ready_at, build.derivation_build);
+                    if after.is_some_and(|after| key <= (after.ready_at, after.build)) {
+                        continue;
+                    }
+                    remaining += 1;
                     if limit == 0
                         || (oldest.len() == limit
                             && oldest
@@ -1984,7 +1990,7 @@ impl JobTracker {
                 _ => {}
             }
         }
-        let builds = oldest
+        let builds: Vec<_> = oldest
             .into_values()
             .map(|build| crate::capacity::ReadyBuild {
                 id: build.derivation_build,
@@ -1996,7 +2002,7 @@ impl JobTracker {
                 estimate: build.estimate.clone(),
             })
             .collect();
-        Ok((total, builds))
+        Ok((total, remaining - builds.len(), builds))
     }
 
     pub fn pending_snapshot(&self) -> Vec<PendingJobInfo> {
@@ -2406,8 +2412,9 @@ mod tests {
         tracker.add_pending("outside".into(), build_job(ProjectId::now_v7(), vec![]));
         expected.sort();
 
-        let (total, batch) = tracker.ready_builds(&scope, 2, usize::MAX).unwrap();
+        let (total, remaining, batch) = tracker.ready_builds(&scope, 2, usize::MAX, None).unwrap();
         assert_eq!(total, 3);
+        assert_eq!(remaining, 1);
         assert_eq!(
             batch
                 .iter()
@@ -2416,10 +2423,78 @@ mod tests {
             expected[..2],
         );
         assert_eq!(tracker.pending_count(), 5);
-        let (total, empty) = tracker.ready_builds(&scope, 0, usize::MAX).unwrap();
+        let after = crate::capacity::BuildCapacityCursor {
+            ready_at: batch[1].ready_at,
+            build: batch[1].id,
+        };
+        let (total, remaining, next) = tracker
+            .ready_builds(&scope, 2, usize::MAX, Some(after))
+            .unwrap();
         assert_eq!(total, 3);
+        assert_eq!(remaining, 0);
+        assert_eq!((next[0].ready_at, next[0].id), expected[2]);
+        let (total, remaining, empty) = tracker.ready_builds(&scope, 0, usize::MAX, None).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(remaining, 3);
         assert!(empty.is_empty());
-        assert!(tracker.ready_builds(&scope, 2, 0).is_err());
+        assert!(tracker.ready_builds(&scope, 2, 0, Some(after)).is_err());
+    }
+
+    #[test]
+    fn capacity_cursors_keep_timestamp_ties_and_do_not_require_the_anchor() {
+        let project = ProjectId::now_v7();
+        let scope = HashSet::from([project]);
+        let mut tracker = JobTracker::new();
+        let now = gradient_types::now();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut job = build_job(project, vec![]);
+            let PendingJob::Build(build) = &mut job else {
+                unreachable!()
+            };
+            build.ready_at = now;
+            let id = build.derivation_build;
+            ids.push(id);
+            tracker.add_pending(id.to_string(), job);
+        }
+        ids.sort_unstable();
+        let (_, _, first) = tracker.ready_builds(&scope, 1, usize::MAX, None).unwrap();
+        assert_eq!(first[0].id, ids[0]);
+        let after = crate::capacity::BuildCapacityCursor {
+            ready_at: now,
+            build: first[0].id,
+        };
+        tracker.remove_job(&ids[0].to_string());
+        let mut earlier = build_job(project, vec![]);
+        let PendingJob::Build(build) = &mut earlier else {
+            unreachable!()
+        };
+        build.ready_at = now - chrono::Duration::seconds(1);
+        let earlier_id = build.derivation_build;
+        tracker.add_pending("earlier".into(), earlier);
+
+        let (total, remaining, next) = tracker
+            .ready_builds(&scope, 1, usize::MAX, Some(after))
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(remaining, 1);
+        assert_eq!(next[0].id, ids[1]);
+        let (_, _, fresh) = tracker.ready_builds(&scope, 1, usize::MAX, None).unwrap();
+        assert_eq!(fresh[0].id, earlier_id);
+        let (total, remaining, empty) = tracker
+            .ready_builds(
+                &scope,
+                1,
+                usize::MAX,
+                Some(crate::capacity::BuildCapacityCursor {
+                    ready_at: now,
+                    build: ids[2],
+                }),
+            )
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(remaining, 0);
+        assert!(empty.is_empty());
     }
 
     fn fetch_eval_job(peer: ProjectId) -> PendingJob {

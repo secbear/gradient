@@ -12,7 +12,7 @@ use gradient_entity::team_user::TeamRole;
 use gradient_entity::{team_project, team_worker, worker_registration};
 use gradient_fixtures::ids::{project_id, team_id};
 use gradient_fixtures::mock::{all_statements, empty_db, exec_ok, mock_db};
-use gradient_fixtures::rows::{team, team_member, user};
+use gradient_fixtures::rows::{live_session, team, team_member, user};
 use gradient_fixtures::test_date;
 use gradient_pool::estimate::BuildEstimate;
 use gradient_pool::session_port::SessionSignal;
@@ -21,7 +21,7 @@ use gradient_scheduler::Scheduler;
 use gradient_scheduler::actor::WorkerMetrics;
 use gradient_scheduler::jobs::{PendingBuildJob, PendingJob, Reattached, build_job_key};
 use gradient_test_support::state::TestState;
-use gradient_test_support::web::{signed_in, signed_in_as};
+use gradient_test_support::web::{bearer, signed_in, signed_in_as, with_auth};
 use gradient_util::shutdown::Shutdown;
 use gradient_wire::types::{
     BuildJob, BuildRequirement, BuildSpec, BuildSpecKind, GradientCapabilities, JobKind,
@@ -161,6 +161,39 @@ fn profile(name: &str, identity: &str, ram_mb: u64) -> Value {
         "enable_build": true,
         "enable_network": true
     })
+}
+
+fn page_state() -> (tempfile::NamedTempFile, TestState) {
+    let key = tempfile::NamedTempFile::new().expect("create capacity cursor key");
+    std::fs::write(key.path(), b"capacity-test-key-32-bytes-padding")
+        .expect("write capacity cursor key");
+    let path = key.path().to_string_lossy().into_owned();
+    (
+        key,
+        TestState::new().config(move |config| config.secrets.crypt_file = path),
+    )
+}
+
+fn page_db(scopes: &[&[ProjectId]], prospective: usize) -> (MockDatabase, String) {
+    let session = SessionId::now_v7();
+    let mut db = mock_db();
+    for (index, projects) in scopes.iter().enumerate() {
+        db = if index == 0 {
+            with_auth(db, session)
+        } else {
+            db.append_query_results([vec![live_session(session)]])
+                .append_query_results([vec![user()]])
+        };
+        db = unregistered(
+            grants(
+                db.append_query_results([vec![team()]])
+                    .append_query_results([vec![team_member(TeamRole::Admin)]]),
+                projects,
+            ),
+            prospective,
+        );
+    }
+    (db, bearer(session))
 }
 
 fn build(project: ProjectId, seconds: i64, estimate: BuildEstimate) -> PendingBuildJob {
@@ -525,6 +558,16 @@ async fn invalid_profiles_and_unknown_fields_are_refused_before_registration_loo
             StatusCode::UNPROCESSABLE_ENTITY,
         ));
     }
+    for page in [
+        json!(true),
+        json!({ "after": 1 }),
+        json!({ "after": null, "unknown_capacity_field": true }),
+    ] {
+        cases.push((
+            json!({ "profiles": [], "build_page": page }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ));
+    }
     for (body, expected) in cases {
         let (db, auth) = scoped_db(TeamRole::Admin, false);
         let test = CapacityTest::start(db, auth).await;
@@ -823,6 +866,7 @@ async fn absent_or_empty_tracking_preserves_the_legacy_response_shape() {
         json!({ "tracked_profiles": [] }),
         json!({ "tracked_profiles": [], "include_waiting_builds": false }),
         json!({ "include_waiting_builds": true }),
+        json!({ "build_page": null }),
     ] {
         let (db, auth) = scoped_db(TeamRole::Admin, false);
         let test = CapacityTest::start(grants(db, &[project_id()]), auth).await;
@@ -1420,8 +1464,20 @@ async fn native_waiting_credit_is_opt_in_capped_and_omitted_for_unselected_owner
     ] {
         let other_project = ProjectId::now_v7();
         let projects = HashSet::from([project_id(), other_project]);
-        let (db, auth) = scoped_db(TeamRole::Admin, false);
-        let test = CapacityTest::start(grants(db, &[project_id(), other_project]), auth).await;
+        let (_key, state) = page_state();
+        let (db, auth) = if truncated {
+            page_db(
+                &[
+                    &[project_id(), other_project],
+                    &[project_id(), other_project],
+                ],
+                0,
+            )
+        } else {
+            let (db, auth) = scoped_db(TeamRole::Admin, false);
+            (grants(db, &[project_id(), other_project]), auth)
+        };
+        let test = CapacityTest::with_state(state, db, auth).await;
         let mut active = build(
             project_id(),
             -1,
@@ -1490,6 +1546,9 @@ async fn native_waiting_credit_is_opt_in_capped_and_omitted_for_unselected_owner
         if scoped_away {
             request["projects"] = json!([other_project]);
         }
+        if truncated {
+            request["build_page"] = json!({});
+        }
         let res = test.post(&request).await;
         res.assert_status_ok();
         for hidden in [
@@ -1539,6 +1598,25 @@ async fn native_waiting_credit_is_opt_in_capped_and_omitted_for_unselected_owner
             }
         }
         assert_eq!(test.scheduler.metrics_snapshot().await, before);
+        if truncated {
+            let cursor = message["build_page"]["next"].as_str().unwrap();
+            let res = test
+                .post(&json!({
+                    "profiles": [],
+                    "include_waiting_builds": true,
+                    "build_page": { "after": cursor }
+                }))
+                .await;
+            res.assert_status_ok();
+            let body: Value = res.json();
+            assert_eq!(
+                body["message"]["workers"][0]["waiting_build"],
+                json!({ "build_index": 0, "ram_credit_mb": 20_000 })
+            );
+            assert_eq!(body["message"]["builds"].as_array().unwrap().len(), 1);
+            assert_eq!(body["message"]["build_page"]["next"], Value::Null);
+            assert_eq!(test.scheduler.metrics_snapshot().await, before);
+        }
         assert_eq!(test.scheduler.workers_info().await[0].assigned_job_count, 1);
         assert_no_registration_or_dispatch(&test.worker_db);
         assert_no_registration_or_dispatch(&test.web_db);
@@ -1579,5 +1657,227 @@ async fn a_bounded_batch_reports_the_total_and_returns_the_oldest_ordinary_build
             .all(|pair| pair[0]["ready_at"].as_str() < pair[1]["ready_at"].as_str())
     );
     assert_eq!(test.scheduler.pending_job_count().await, 132);
+    test.stop().await;
+}
+
+#[tokio::test]
+async fn capacity_pages_reach_fit_work_behind_an_unfit_prefix_without_disclosing_ids() {
+    for prefix in ["architecture", "features", "memory"] {
+        let (key, state) = page_state();
+        let (db, auth) = page_db(&[&[project_id()], &[project_id()]], 1);
+        let test = CapacityTest::with_state(state, db, auth).await;
+        let mut anchor = None;
+        for seconds in 0..128 {
+            let mut job = build(
+                project_id(),
+                seconds,
+                BuildEstimate::fixed(
+                    Some(if prefix == "memory" { 120_000 } else { 1_000 }),
+                    None,
+                    1,
+                ),
+            );
+            job.estimate.max_cores = Some(1);
+            match prefix {
+                "architecture" => job.job.requirement.architecture = "aarch64-linux".into(),
+                "features" => job.job.requirement.required_features = vec!["missing".into()],
+                _ => {}
+            }
+            if seconds == 127 {
+                anchor = Some(job.derivation_build);
+            }
+            test.enqueue(job).await;
+        }
+        let ready = build(
+            project_id(),
+            128,
+            BuildEstimate::fixed(Some(1_000), None, 1),
+        );
+        let hidden = [
+            ready.derivation_build.to_string(),
+            ready.derivation.to_string(),
+            ready.evaluation_id.to_string(),
+            project_id().to_string(),
+            anchor.unwrap().to_string(),
+        ];
+        test.enqueue(ready).await;
+        let before = test.scheduler.metrics_snapshot().await;
+        let first = test
+            .post(&json!({
+                "profiles": [profile("builder", INTENDED, 60_000)],
+                "build_page": {}
+            }))
+            .await;
+        first.assert_status_ok();
+        let body: Value = first.json();
+        let message = &body["message"];
+        assert_eq!(message["total_ready_builds"], 129);
+        assert_eq!(message["build_page"]["remaining_ready_builds"], 1);
+        assert_eq!(message["builds"].as_array().unwrap().len(), 128);
+        for build in message["builds"].as_array().unwrap() {
+            if prefix == "memory" {
+                assert_eq!(build["profiles"][0]["prediction_fit"], "does_not_fit");
+            } else {
+                assert_eq!(build["profiles"], json!([null]));
+            }
+        }
+        let cursor = message["build_page"]["next"].as_str().unwrap();
+        assert!(!cursor.is_empty());
+        let plaintext = gradient_ci::actions::decrypt_action_secret(
+            cursor,
+            &std::fs::read(key.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&plaintext).unwrap(),
+            json!({
+                "kind": "build_capacity_page_v1",
+                "team": team_id(),
+                "projects": [project_id()],
+                "after": {
+                    "ready_at": test_date() + Duration::seconds(127),
+                    "build": anchor.unwrap()
+                }
+            })
+        );
+        for id in &hidden {
+            assert!(!first.text().contains(id), "response disclosed {id}");
+        }
+        let second = test
+            .post(&json!({
+                "profiles": [profile("builder", INTENDED, 60_000)],
+                "build_page": { "after": cursor }
+            }))
+            .await;
+        second.assert_status_ok();
+        let body: Value = second.json();
+        let message = &body["message"];
+        assert_eq!(message["total_ready_builds"], 129);
+        assert_eq!(message["builds_truncated"], true);
+        assert_eq!(message["build_page"]["remaining_ready_builds"], 0);
+        assert_eq!(message["build_page"]["next"], Value::Null);
+        assert_eq!(message["builds"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            message["builds"][0]["ready_at"],
+            json!(test_date() + Duration::seconds(128))
+        );
+        assert_eq!(
+            message["builds"][0]["profiles"][0]["prediction_fit"],
+            "fits"
+        );
+        for id in &hidden {
+            assert!(!second.text().contains(id), "response disclosed {id}");
+        }
+        assert_eq!(test.scheduler.metrics_snapshot().await, before);
+        assert_no_registration_or_dispatch(&test.worker_db);
+        assert_no_registration_or_dispatch(&test.web_db);
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn capacity_cursors_bind_resolved_scope_and_reject_invalid_ciphertext() {
+    let (key, state) = page_state();
+    let other = ProjectId::now_v7();
+    let scope = [project_id(), other];
+    let (db, auth) = page_db(
+        &[
+            &scope,
+            &scope,
+            &[project_id()],
+            &scope,
+            &scope,
+            &scope,
+            &scope,
+        ],
+        0,
+    );
+    let test = CapacityTest::with_state(state, db, auth).await;
+    for seconds in 0..129 {
+        test.enqueue(build(project_id(), seconds, BuildEstimate::default()))
+            .await;
+    }
+    let first = test
+        .post(&json!({ "profiles": [], "build_page": {} }))
+        .await;
+    first.assert_status_ok();
+    let body: Value = first.json();
+    let cursor = body["message"]["build_page"]["next"].as_str().unwrap();
+    let next = test
+        .post(&json!({
+            "projects": [other, project_id()],
+            "profiles": [],
+            "build_page": { "after": cursor }
+        }))
+        .await;
+    next.assert_status_ok();
+    let body: Value = next.json();
+    assert_eq!(body["message"]["build_page"]["next"], Value::Null);
+    let changed = test
+        .post(&json!({ "profiles": [], "build_page": { "after": cursor } }))
+        .await;
+    changed.assert_status(StatusCode::BAD_REQUEST);
+    let malformed = test
+        .post(&json!({ "profiles": [], "build_page": { "after": "not base64" } }))
+        .await;
+    malformed.assert_status(StatusCode::BAD_REQUEST);
+    let tampered = format!(
+        "{}{}",
+        if cursor.starts_with('A') { 'B' } else { 'A' },
+        &cursor[1..]
+    );
+    test.post(&json!({ "profiles": [], "build_page": { "after": tampered } }))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    for (kind, team) in [
+        ("other_feature", team_id()),
+        ("build_capacity_page_v1", TeamId::now_v7()),
+    ] {
+        let plaintext = json!({
+            "kind": kind,
+            "team": team,
+            "projects": scope,
+            "after": { "ready_at": test_date(), "build": DerivationBuildId::now_v7() }
+        });
+        let encrypted = gradient_ci::actions::encrypt_action_secret(
+            &plaintext.to_string(),
+            &std::fs::read(key.path()).unwrap(),
+        )
+        .unwrap();
+        test.post(&json!({ "profiles": [], "build_page": { "after": encrypted } }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(test.scheduler.pending_job_count().await, 129);
+    assert_no_registration_or_dispatch(&test.worker_db);
+    assert_no_registration_or_dispatch(&test.web_db);
+    test.stop().await;
+}
+
+#[tokio::test]
+async fn a_missing_cursor_key_refuses_only_paged_assessments() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("missing-key")
+        .to_string_lossy()
+        .into_owned();
+    let state = TestState::new().config(move |config| config.secrets.crypt_file = path);
+    let (db, auth) = page_db(&[&[project_id()], &[project_id()]], 0);
+    let test = CapacityTest::with_state(state, db, auth).await;
+    test.enqueue(build(project_id(), 0, BuildEstimate::default()))
+        .await;
+    let legacy = test.post(&json!({ "profiles": [] })).await;
+    legacy.assert_status_ok();
+    let body: Value = legacy.json();
+    assert_eq!(body["message"]["total_ready_builds"], 1);
+    assert!(body["message"].get("build_page").is_none());
+    let paged = test
+        .post(&json!({ "profiles": [], "build_page": {} }))
+        .await;
+    paged.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = paged.json();
+    assert!(body["message"].get("total_ready_builds").is_none());
+    assert_eq!(test.scheduler.pending_job_count().await, 1);
     test.stop().await;
 }

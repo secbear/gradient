@@ -12240,6 +12240,8 @@ paths:
 
         Returns the oldest 128 ready ordinary builds with the total backlog and a truncation flag. Live workers are never sampled. Limits are 16 prospective profiles, 256 tracked profiles, 256 project IDs and 64 KiB. Capture, scan or worker-limit failures return 503.
 
+        Set build_page to {} to request an opaque continuation, then pass build_page.next as build_page.after with the same team and resolved project scope. Each page captures fresh state and scans the bounded local queue; pages cannot be combined as one capacity snapshot. Bound page requests per planning cycle. Restart at the beginning when next is null or the scope changes. New work before the cursor appears on that next pass. remaining_ready_builds counts ready work beyond this page; total_ready_builds and builds_truncated still describe the full scoped backlog.
+
         Prospective profiles require unregistered UUIDs and planned build/network enable flags. Tracked profiles require active, build-enabled registrations owned by this team. Saved registration flags additionally restrict their network capability. A connected tracked worker never receives a starting-profile assessment, even when it has no scoped live-worker index. All profile fits remain conditional on valid worker tokens, project caches and matching advertised resources.
 
         include_waiting_builds adds once-only RAM credit for a waiting build in the selected batch. The credit is the native usable-budget difference, not raw reserved RAM. Fit does not imply a free slot. Unknown predictions remain distinct from fallback reservations. captured_at is not a metrics sample timestamp.
@@ -15869,6 +15871,11 @@ components:
         include_waiting_builds:
           type: boolean
           description: Include once-only RAM credit for a waiting build in the selected batch.
+        build_page:
+          oneOf:
+          - $ref: '#/components/schemas/CapacityBuildPageRequest'
+            description: Request queue continuation; omit to retain the oldest-build assessment.
+          - type: 'null'
       additionalProperties: false
     CapacityAssessmentResponse:
       type: object
@@ -15908,6 +15915,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TrackedCapacityWorker'
+        build_page:
+          oneOf:
+          - $ref: '#/components/schemas/CapacityBuildPage'
+          - type: 'null'
     CapacityBuild:
       type: object
       required:
@@ -15950,6 +15961,28 @@ components:
             - $ref: '#/components/schemas/BuildProfileAssessment'
             - type: 'null'
           description: Entries correspond to tracked_workers; connected workers never receive starting credit.
+    CapacityBuildPage:
+      type: object
+      required:
+      - remaining_ready_builds
+      properties:
+        remaining_ready_builds:
+          type: integer
+          description: Ready ordinary builds beyond this page in the current scope.
+          minimum: 0
+        next:
+          type:
+          - string
+          - 'null'
+          description: Opaque continuation, or null when the current suffix is exhausted.
+    CapacityBuildPageRequest:
+      type: object
+      properties:
+        after:
+          type:
+          - string
+          - 'null'
+      additionalProperties: false
     CapacityProfileRequest:
       type: object
       required:

@@ -509,6 +509,7 @@ export interface CapacityAssessmentRequest {
   profiles: CapacityProfileRequest[];
   tracked_profiles?: CapacityProfileRequest[];
   include_waiting_builds?: boolean;
+  build_page?: CapacityBuildPageRequest | null;
 }
 
 export interface CapacityAssessmentResponse {
@@ -520,6 +521,7 @@ export interface CapacityAssessmentResponse {
   profiles: BuildCapacityProfile[];
   builds: CapacityBuild[];
   tracked_workers?: TrackedCapacityWorker[];
+  build_page?: CapacityBuildPage | null;
 }
 
 export interface CapacityBuild {
@@ -530,6 +532,15 @@ export interface CapacityBuild {
   workers: (BuildResourceAssessment | null)[];
   profiles: (BuildProfileAssessment | null)[];
   tracked_workers?: (BuildProfileAssessment | null)[];
+}
+
+export interface CapacityBuildPage {
+  remaining_ready_builds: number;
+  next?: string | null;
+}
+
+export interface CapacityBuildPageRequest {
+  after?: string | null;
 }
 
 export interface CapacityProfileRequest {

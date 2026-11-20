@@ -34,6 +34,8 @@ pub(crate) enum TeamRefusal {
     DuplicateTrackedWorker,
     #[error("a tracked team worker is inactive or does not permit builds")]
     TrackedWorkerCannotBuild,
+    #[error("invalid capacity cursor; restart the build-page assessment")]
+    InvalidCapacityCursor,
 }
 
 impl Refusal for TeamRefusal {
@@ -45,7 +47,7 @@ impl Refusal for TeamRefusal {
             | Self::InvalidNewProjectRole
             | Self::CapacityRequestTooLarge
             | Self::InvalidCapacityProfile(_) => RefusalStatus::BadRequest,
-            Self::DuplicateTrackedWorker => RefusalStatus::BadRequest,
+            Self::DuplicateTrackedWorker | Self::InvalidCapacityCursor => RefusalStatus::BadRequest,
             Self::WorkersNeedTeamAdmin | Self::CapacityProjectNotGranted => {
                 RefusalStatus::Forbidden
             }

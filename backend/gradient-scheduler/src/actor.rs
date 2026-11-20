@@ -383,6 +383,7 @@ pub enum SchedulerMsg {
         draining: crate::draining::Draining,
         limits: Option<crate::capacity::BuildCapacityLimits>,
         tracked_workers: Vec<String>,
+        after: Option<crate::capacity::BuildCapacityCursor>,
         reply: RpcReplyPort<anyhow::Result<crate::capacity::BuildCapacitySnapshot>>,
     },
     BoardActiveJobs {
@@ -593,6 +594,7 @@ impl SchedulerCore {
         server_draining: bool,
         limits: Option<crate::capacity::BuildCapacityLimits>,
         tracked_workers: &[String],
+        after: Option<crate::capacity::BuildCapacityCursor>,
     ) -> anyhow::Result<crate::capacity::BuildCapacitySnapshot> {
         let connected_workers = tracked_workers
             .iter()
@@ -605,6 +607,7 @@ impl SchedulerCore {
                 server_draining,
                 builds: vec![],
                 total_ready_builds: 0,
+                remaining_ready_builds: 0,
                 workers: vec![],
                 connected_workers,
                 instance: *instance,
@@ -616,10 +619,11 @@ impl SchedulerCore {
                 .capacity_scan_fits(limits.scanned_workers, limits.assigned_jobs_per_worker,)),
             "too much fleet state to scan for a capacity assessment"
         );
-        let (total_ready_builds, builds) = self.tracker.ready_builds(
+        let (total_ready_builds, remaining_ready_builds, builds) = self.tracker.ready_builds(
             projects,
             limits.map_or(usize::MAX, |limits| limits.builds),
             limits.map_or(usize::MAX, |limits| limits.scanned_jobs),
+            after,
         )?;
         let workers = self
             .pool
@@ -680,6 +684,7 @@ impl SchedulerCore {
             server_draining,
             builds,
             total_ready_builds,
+            remaining_ready_builds,
             workers,
             connected_workers,
             instance: self.with_live_transfers(instance),
@@ -1528,6 +1533,7 @@ impl Actor for CoreActor {
                 draining,
                 limits,
                 tracked_workers,
+                after,
                 reply,
             } => {
                 if reply.is_closed() {
@@ -1543,6 +1549,7 @@ impl Actor for CoreActor {
                     server_draining,
                     limits,
                     &tracked_workers,
+                    after,
                 ));
             }
             SchedulerMsg::BoardActiveJobs { reply } => {
@@ -1650,10 +1657,17 @@ mod tests {
             .record("w1", crate::cluster::SlotKind::Build, Instant::now());
         assert_eq!(core.cluster_snapshot(Instant::now()).slots.len(), 1);
         assert_eq!(
-            core.build_capacity_snapshot(&projects, &InstanceContext::default(), false, None, &[],)
-                .unwrap()
-                .workers
-                .len(),
+            core.build_capacity_snapshot(
+                &projects,
+                &InstanceContext::default(),
+                false,
+                None,
+                &[],
+                None
+            )
+            .unwrap()
+            .workers
+            .len(),
             1
         );
         core.pool
@@ -1665,6 +1679,7 @@ mod tests {
                 false,
                 None,
                 &["w1".into()],
+                None,
             )
             .unwrap();
         assert!(snapshot.connected_workers.contains("w1"));
@@ -1881,7 +1896,14 @@ mod tests {
                 since: std::time::Instant::now(),
             });
             let snapshot = core
-                .build_capacity_snapshot(&projects, &InstanceContext::default(), false, None, &[])
+                .build_capacity_snapshot(
+                    &projects,
+                    &InstanceContext::default(),
+                    false,
+                    None,
+                    &[],
+                    None,
+                )
                 .unwrap();
             assert_eq!(snapshot.builds.len(), 1);
             assert_eq!(snapshot.workers[0].free_slots, expected);
@@ -1904,6 +1926,7 @@ mod tests {
                 false,
                 Some(limits),
                 &[],
+                None,
             )
         };
         let limits = BuildCapacityLimits {
@@ -1965,11 +1988,19 @@ mod tests {
                 assigned_jobs_per_worker: 0,
             }),
             &[],
+            None,
         );
         assert!(limited.is_err());
         assert!(
-            core.build_capacity_snapshot(&projects, &InstanceContext::default(), false, None, &[])
-                .is_ok()
+            core.build_capacity_snapshot(
+                &projects,
+                &InstanceContext::default(),
+                false,
+                None,
+                &[],
+                None
+            )
+            .is_ok()
         );
     }
 

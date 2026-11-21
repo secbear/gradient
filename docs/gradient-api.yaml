@@ -15226,6 +15226,112 @@ components:
           oneOf:
           - $ref: '#/components/schemas/ExecOffer'
           - type: 'null'
+    BootstrapCapacityAssessment:
+      type: object
+      required:
+      - observed_at
+      - complete
+      - demands
+      - profiles
+      - tracked_workers
+      properties:
+        observed_at:
+          type: string
+          format: date-time
+          description: Observation time of the separately captured waiting and input-fetch sources.
+        complete:
+          type: boolean
+        demands:
+          type: array
+          items:
+            $ref: '#/components/schemas/BootstrapCapacityDemand'
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/BootstrapCapacityProfile'
+        tracked_workers:
+          type: array
+          items:
+            $ref: '#/components/schemas/BootstrapTrackedWorker'
+    BootstrapCapacityDemand:
+      type: object
+      required:
+      - kind
+      - available
+      - profiles
+      - tracked_workers
+      properties:
+        kind:
+          $ref: '#/components/schemas/BootstrapDemandKind'
+        available:
+          type: boolean
+        profiles:
+          type: array
+          items:
+            type: boolean
+        tracked_workers:
+          type: array
+          items:
+            type: boolean
+    BootstrapCapacityProfile:
+      type: object
+      required:
+      - profile
+      properties:
+        profile:
+          $ref: '#/components/schemas/CapabilityProfile'
+        build_profile_index:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+    BootstrapCapacityRequest:
+      type: object
+      required:
+      - profiles
+      properties:
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/BootstrapProfileRequest'
+        tracked_profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/BootstrapProfileRequest'
+      additionalProperties: false
+    BootstrapDemandKind:
+      type: string
+      enum:
+      - download
+      - substitution
+      - evaluation
+      - input_fetch
+    BootstrapProfileRequest:
+      type: object
+      required:
+      - profile
+      - registration
+      properties:
+        profile:
+          $ref: '#/components/schemas/CapabilityProfile'
+        registration:
+          $ref: '#/components/schemas/RegistrationCapabilities'
+      additionalProperties: false
+    BootstrapTrackedWorker:
+      type: object
+      required:
+      - profile
+      - connected
+      properties:
+        profile:
+          $ref: '#/components/schemas/CapabilityProfile'
+        connected:
+          type: boolean
+        build_tracked_index:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
     BuildAttemptId:
       type: string
       format: uuid
@@ -15847,6 +15953,23 @@ components:
     CacheUpstreamId:
       type: string
       format: uuid
+    CapabilityProfile:
+      type: object
+      required:
+      - name
+      - worker_id
+      - capabilities
+      - resources
+      properties:
+        name:
+          type: string
+        worker_id:
+          type: string
+        capabilities:
+          $ref: '#/components/schemas/GradientCapabilities'
+        resources:
+          $ref: '#/components/schemas/WorkerProfile'
+      additionalProperties: false
     CapacityAssessmentRequest:
       type: object
       required:
@@ -15875,6 +15998,11 @@ components:
           oneOf:
           - $ref: '#/components/schemas/CapacityBuildPageRequest'
             description: Request queue continuation; omit to retain the oldest-build assessment.
+          - type: 'null'
+        bootstrap:
+          oneOf:
+          - $ref: '#/components/schemas/BootstrapCapacityRequest'
+            description: Include scoped capability coverage for the supported worker operations.
           - type: 'null'
       additionalProperties: false
     CapacityAssessmentResponse:
@@ -15918,6 +16046,10 @@ components:
         build_page:
           oneOf:
           - $ref: '#/components/schemas/CapacityBuildPage'
+          - type: 'null'
+        bootstrap:
+          oneOf:
+          - $ref: '#/components/schemas/BootstrapCapacityAssessment'
           - type: 'null'
     CapacityBuild:
       type: object
@@ -15998,6 +16130,11 @@ components:
         enable_build:
           type: boolean
           description: Whether the intended registration will permit builds.
+        registration:
+          oneOf:
+          - $ref: '#/components/schemas/RegistrationCapabilities'
+            description: Planned registration permissions for an optional bootstrap assessment.
+          - type: 'null'
       additionalProperties: false
     CapacityWaitingBuild:
       type: object
@@ -21443,6 +21580,26 @@ components:
           type:
           - string
           - 'null'
+    RegistrationCapabilities:
+      type: object
+      required:
+      - enable_build
+      - enable_network
+      - enable_eval
+      - enable_secrets
+      - enable_exec
+      properties:
+        enable_build:
+          type: boolean
+        enable_network:
+          type: boolean
+        enable_eval:
+          type: boolean
+        enable_secrets:
+          type: boolean
+        enable_exec:
+          type: boolean
+      additionalProperties: false
     RemoveMemberRequest:
       type: object
       required:

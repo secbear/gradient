@@ -153,6 +153,22 @@ pub fn create_router_with_scheduler(
     state: Arc<ServerState>,
     scheduler: Arc<Scheduler>,
 ) -> Result<Router, InitError> {
+    create_router_inner(state, scheduler, true)
+}
+
+/// Builds routes without starting background services.
+pub fn build_router_with_scheduler(
+    state: Arc<ServerState>,
+    scheduler: Arc<Scheduler>,
+) -> Result<Router, InitError> {
+    create_router_inner(state, scheduler, false)
+}
+
+fn create_router_inner(
+    state: Arc<ServerState>,
+    scheduler: Arc<Scheduler>,
+    start_services: bool,
+) -> Result<Router, InitError> {
     let serve_url: http::HeaderValue =
         state
             .config
@@ -299,39 +315,41 @@ pub fn create_router_with_scheduler(
             .merge(public_listing_api.route_layer(GovernorLayer::new(Arc::clone(&caller_limit))));
     }
 
-    scheduler.start();
-    state.shutdown.supervise(ChildSpec::pass(
-        gradient_db::maintenance::retention::Retention::new(state.db()),
-    ));
-    state
-        .shutdown
-        .supervise(ChildSpec::pass(gradient_db::metrics::rollup::Rollup::new(
-            state.db(),
-        )));
-    state.shutdown.supervise(ChildSpec::pass(
-        gradient_db::metrics::cache_traffic::CacheMetricFlush::new(
+    let sessions = gradient_proto::SessionsHandle::new();
+    if start_services {
+        scheduler.start();
+        state.shutdown.supervise(ChildSpec::pass(
+            gradient_db::maintenance::retention::Retention::new(state.db()),
+        ));
+        state
+            .shutdown
+            .supervise(ChildSpec::pass(gradient_db::metrics::rollup::Rollup::new(
+                state.db(),
+            )));
+        state.shutdown.supervise(ChildSpec::pass(
+            gradient_db::metrics::cache_traffic::CacheMetricFlush::new(
+                state.db(),
+                Arc::clone(&state.memory.cache_traffic),
+            ),
+        ));
+        gradient_db::metrics::cache_traffic::flush_on_shutdown(
             state.db(),
             Arc::clone(&state.memory.cache_traffic),
-        ),
-    ));
-    gradient_db::metrics::cache_traffic::flush_on_shutdown(
-        state.db(),
-        Arc::clone(&state.memory.cache_traffic),
-    );
-    state.shutdown.supervise(ChildSpec::pass(
-        gradient_db::metrics::infra::InfraMetricFlush::new(state.db()),
-    ));
-    gradient_db::metrics::infra::flush_on_shutdown(state.db());
-    otlp::start_otlp(Arc::clone(&state), Arc::clone(&scheduler));
-    let sessions = gradient_proto::SessionsHandle::new();
-    state
-        .shutdown
-        .supervise(sessions.child_spec(Arc::clone(&scheduler)));
-    gradient_proto::outbound::start_outbound_loop(
-        Arc::clone(&state),
-        Arc::clone(&scheduler),
-        Arc::clone(&sessions),
-    );
+        );
+        state.shutdown.supervise(ChildSpec::pass(
+            gradient_db::metrics::infra::InfraMetricFlush::new(state.db()),
+        ));
+        gradient_db::metrics::infra::flush_on_shutdown(state.db());
+        otlp::start_otlp(Arc::clone(&state), Arc::clone(&scheduler));
+        state
+            .shutdown
+            .supervise(sessions.child_spec(Arc::clone(&scheduler)));
+        gradient_proto::outbound::start_outbound_loop(
+            Arc::clone(&state),
+            Arc::clone(&scheduler),
+            Arc::clone(&sessions),
+        );
+    }
 
     let proto_limiter = Arc::new(ProtoLimiter::new(state.config.proto.max_connections.get()));
 

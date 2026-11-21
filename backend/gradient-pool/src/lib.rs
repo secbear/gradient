@@ -23,7 +23,7 @@ pub use self::exec_fit::exec_unmet;
 pub use self::input_request::InputRequest;
 pub use self::job_policy::{AllowedJobs, EveryJobAllowed, WorkerJob, WorkerJobPolicy};
 pub use self::peer_auth::PeerAuth;
-pub use self::worker_caps::{DeviceCount, WorkerCaps, build_needs_network};
+pub use self::worker_caps::{DeviceCount, EvaluationRequirement, WorkerCaps, build_needs_network};
 pub use self::worker_health::{WorkerHealthInfo, WorkerReadiness};
 pub use self::worker_pool::{ExecOffer, WorkerInfo, WorkerPool, WorkerSlot};
 pub use self::worker_state::{WorkerProfile, WorkerShared};

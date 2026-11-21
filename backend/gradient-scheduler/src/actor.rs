@@ -381,9 +381,8 @@ pub enum SchedulerMsg {
         projects: HashSet<ProjectId>,
         instance: InstanceContext,
         draining: crate::draining::Draining,
-        limits: Option<crate::capacity::BuildCapacityLimits>,
+        capture: crate::capacity::BuildCapacityCapture,
         tracked_workers: Vec<String>,
-        after: Option<crate::capacity::BuildCapacityCursor>,
         reply: RpcReplyPort<anyhow::Result<crate::capacity::BuildCapacitySnapshot>>,
     },
     BoardActiveJobs {
@@ -592,10 +591,10 @@ impl SchedulerCore {
         projects: &HashSet<ProjectId>,
         instance: &InstanceContext,
         server_draining: bool,
-        limits: Option<crate::capacity::BuildCapacityLimits>,
+        capture: crate::capacity::BuildCapacityCapture,
         tracked_workers: &[String],
-        after: Option<crate::capacity::BuildCapacityCursor>,
     ) -> anyhow::Result<crate::capacity::BuildCapacitySnapshot> {
+        let limits = capture.limits;
         let connected_workers = tracked_workers
             .iter()
             .filter(|worker| self.pool.is_connected(worker))
@@ -611,6 +610,14 @@ impl SchedulerCore {
                 workers: vec![],
                 connected_workers,
                 instance: *instance,
+                bootstrap: capture
+                    .bootstrap
+                    .then(|| crate::bootstrap::BootstrapSnapshot {
+                        workers: vec![],
+                        pending: vec![],
+                        pending_evaluations: HashSet::new(),
+                        complete: true,
+                    }),
             });
         }
         anyhow::ensure!(
@@ -623,8 +630,54 @@ impl SchedulerCore {
             projects,
             limits.map_or(usize::MAX, |limits| limits.builds),
             limits.map_or(usize::MAX, |limits| limits.scanned_jobs),
-            after,
+            capture.after,
         )?;
+        let bootstrap = if capture.bootstrap {
+            let (pending, pending_evaluations, complete) = self.tracker.bootstrap_pending(
+                projects,
+                crate::bootstrap::MAX_BOOTSTRAP_JOBS,
+                limits.map_or(usize::MAX, |limits| limits.scanned_jobs),
+            )?;
+            let workers = self
+                .pool
+                .worker_infos()
+                .filter_map(|worker| {
+                    let authorized = self
+                        .pool
+                        .peer_auth_for(&worker.id)
+                        .and_then(|auth| auth.as_filter())
+                        .cloned();
+                    if authorized
+                        .as_ref()
+                        .is_some_and(|peers| peers.is_disjoint(projects))
+                    {
+                        return None;
+                    }
+                    let caps = self.pool.worker_caps(&worker.id)?;
+                    let ready = !server_draining && worker.ready_for_jobs();
+                    Some(crate::bootstrap::BootstrapWorker {
+                        id: worker.id,
+                        caps,
+                        authorized,
+                        ready,
+                        max_concurrent_builds: worker.max_concurrent_builds,
+                    })
+                })
+                .take(limits.map_or(usize::MAX, |limits| limits.workers.saturating_add(1)))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                limits.is_none_or(|limits| workers.len() <= limits.workers),
+                "too many workers for a bootstrap assessment"
+            );
+            Some(crate::bootstrap::BootstrapSnapshot {
+                workers,
+                pending,
+                pending_evaluations,
+                complete,
+            })
+        } else {
+            None
+        };
         let workers = self
             .pool
             .worker_infos()
@@ -688,6 +741,7 @@ impl SchedulerCore {
             workers,
             connected_workers,
             instance: self.with_live_transfers(instance),
+            bootstrap,
         })
     }
 
@@ -1531,9 +1585,8 @@ impl Actor for CoreActor {
                 projects,
                 instance,
                 draining,
-                limits,
+                capture,
                 tracked_workers,
-                after,
                 reply,
             } => {
                 if reply.is_closed() {
@@ -1547,9 +1600,8 @@ impl Actor for CoreActor {
                     &projects,
                     &instance,
                     server_draining,
-                    limits,
+                    capture,
                     &tracked_workers,
-                    after,
                 ));
             }
             SchedulerMsg::BoardActiveJobs { reply } => {
@@ -1661,9 +1713,8 @@ mod tests {
                 &projects,
                 &InstanceContext::default(),
                 false,
-                None,
+                crate::capacity::BuildCapacityCapture::default(),
                 &[],
-                None
             )
             .unwrap()
             .workers
@@ -1677,9 +1728,8 @@ mod tests {
                 &projects,
                 &InstanceContext::default(),
                 false,
-                None,
+                crate::capacity::BuildCapacityCapture::default(),
                 &["w1".into()],
-                None,
             )
             .unwrap();
         assert!(snapshot.connected_workers.contains("w1"));
@@ -1900,9 +1950,8 @@ mod tests {
                     &projects,
                     &InstanceContext::default(),
                     false,
-                    None,
+                    crate::capacity::BuildCapacityCapture::default(),
                     &[],
-                    None,
                 )
                 .unwrap();
             assert_eq!(snapshot.builds.len(), 1);
@@ -1924,9 +1973,11 @@ mod tests {
                 &projects,
                 &InstanceContext::default(),
                 false,
-                Some(limits),
+                crate::capacity::BuildCapacityCapture {
+                    limits: Some(limits),
+                    ..Default::default()
+                },
                 &[],
-                None,
             )
         };
         let limits = BuildCapacityLimits {
@@ -1980,15 +2031,17 @@ mod tests {
             &projects,
             &InstanceContext::default(),
             false,
-            Some(crate::capacity::BuildCapacityLimits {
-                builds: 1,
-                workers: 1,
-                scanned_jobs: usize::MAX,
-                scanned_workers: usize::MAX,
-                assigned_jobs_per_worker: 0,
-            }),
+            crate::capacity::BuildCapacityCapture {
+                limits: Some(crate::capacity::BuildCapacityLimits {
+                    builds: 1,
+                    workers: 1,
+                    scanned_jobs: usize::MAX,
+                    scanned_workers: usize::MAX,
+                    assigned_jobs_per_worker: 0,
+                }),
+                ..Default::default()
+            },
             &[],
-            None,
         );
         assert!(limited.is_err());
         assert!(
@@ -1996,9 +2049,8 @@ mod tests {
                 &projects,
                 &InstanceContext::default(),
                 false,
-                None,
+                crate::capacity::BuildCapacityCapture::default(),
                 &[],
-                None
             )
             .is_ok()
         );

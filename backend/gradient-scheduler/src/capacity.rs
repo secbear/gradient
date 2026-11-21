@@ -118,6 +118,7 @@ pub struct BuildCapacityAssessment {
     pub snapshot: BuildCapacitySnapshot,
     pub profiles: Vec<ProspectiveBuildWorker>,
     pub tracked_profiles: Vec<ProspectiveBuildWorker>,
+    pub(crate) bootstrap: Option<crate::bootstrap::BootstrapInputs>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
@@ -128,6 +129,18 @@ pub struct BuildProfileAssessment {
 }
 
 impl BuildCapacityAssessment {
+    pub fn assess_bootstrap(&self) -> Option<crate::bootstrap::BootstrapCapacityAssessment> {
+        let inputs = self.bootstrap.as_ref()?;
+        Some(crate::bootstrap::assess(
+            &self.snapshot,
+            &inputs.observation,
+            &inputs.profiles,
+            &inputs.tracked_workers,
+            &inputs.projects,
+            &inputs.policy,
+        ))
+    }
+
     pub fn assess_tracked_profile(
         &self,
         build: &ReadyBuild,
@@ -197,6 +210,14 @@ pub struct BuildCapacitySnapshot {
     /// Requested identities connected to this instance, independently of project eligibility.
     pub connected_workers: HashSet<String>,
     pub instance: InstanceContext,
+    pub(crate) bootstrap: Option<crate::bootstrap::BootstrapSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildCapacityCapture {
+    pub limits: Option<BuildCapacityLimits>,
+    pub after: Option<BuildCapacityCursor>,
+    pub bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -324,6 +345,7 @@ mod tests {
             server_draining: false,
             total_ready_builds: 1,
             remaining_ready_builds: 0,
+            bootstrap: None,
             connected_workers: HashSet::new(),
             builds: vec![ReadyBuild {
                 id: DerivationBuildId::now_v7(),
@@ -395,6 +417,7 @@ mod tests {
         BuildCapacityAssessment {
             snapshot,
             tracked_profiles: vec![],
+            bootstrap: None,
             profiles: profiles
                 .into_iter()
                 .map(|profile| profile.prospective_worker(&projects, &policy))

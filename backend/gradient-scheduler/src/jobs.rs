@@ -2005,6 +2005,84 @@ impl JobTracker {
         Ok((total, remaining - builds.len(), builds))
     }
 
+    pub(crate) fn bootstrap_pending(
+        &self,
+        projects: &HashSet<ProjectId>,
+        limit: usize,
+        scan_limit: usize,
+    ) -> anyhow::Result<(
+        Vec<crate::bootstrap::BootstrapJob>,
+        HashSet<EvaluationId>,
+        bool,
+    )> {
+        anyhow::ensure!(
+            self.pending.capacity() <= scan_limit
+                && self
+                    .clusters
+                    .capacity_scan_fits(scan_limit.saturating_sub(self.pending.capacity())),
+            "too many pending jobs to scan for bootstrap capacity"
+        );
+        let mut selected = BTreeMap::new();
+        let mut evaluations = HashSet::new();
+        let mut total = 0;
+        let mut complete = !self
+            .clusters
+            .jobs()
+            .any(|(_, job)| projects.contains(&job.project_id()));
+        for (key, job) in &self.pending {
+            if !projects.contains(&job.project_id()) {
+                continue;
+            }
+            match job {
+                PendingJob::Exec(_) => {
+                    complete = false;
+                    continue;
+                }
+                PendingJob::Build(build) if build.job.build.kind == BuildSpecKind::Build => {
+                    continue;
+                }
+                PendingJob::Eval(eval) => {
+                    evaluations.insert(eval.evaluation_id);
+                }
+                _ => {}
+            }
+            total += 1;
+            let order = (job.ready_at(), key);
+            if limit == 0
+                || (selected.len() == limit
+                    && selected
+                        .last_key_value()
+                        .is_some_and(|(last, _)| order >= *last))
+            {
+                continue;
+            }
+            selected.insert(order, job);
+            if selected.len() > limit {
+                selected.pop_last();
+            }
+        }
+        complete &= total <= selected.len();
+        let payload = selected.values().try_fold(0, |bytes, job| {
+            crate::bootstrap::BootstrapJob::payload_bytes(
+                job,
+                crate::bootstrap::MAX_BOOTSTRAP_BYTES - bytes,
+            )
+            .map(|payload| bytes + payload)
+        });
+        anyhow::ensure!(
+            payload.is_some(),
+            "bootstrap policy context exceeds payload limit"
+        );
+        Ok((
+            selected
+                .into_values()
+                .filter_map(crate::bootstrap::BootstrapJob::of)
+                .collect(),
+            evaluations,
+            complete,
+        ))
+    }
+
     pub fn pending_snapshot(&self) -> Vec<PendingJobInfo> {
         let members = self
             .clusters
@@ -2495,6 +2573,70 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(remaining, 0);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_capture_keeps_only_eligibility_and_marks_scoped_clusters_partial() {
+        let project = ProjectId::now_v7();
+        let scope = HashSet::from([project]);
+        let mut tracker = JobTracker::new();
+        let mut eval = crate::test_jobs::eval_job(project);
+        eval.job
+            .steps
+            .push(gradient_wire::types::FlakeStep::FetchFlake);
+        eval.job.source = gradient_wire::types::FlakeSource::Repository {
+            url: "git+ssh://git@example.invalid/repo".into(),
+            commit: "x".repeat(1024 * 1024),
+        };
+        eval.job.wildcards = vec!["y".repeat(1024 * 1024)];
+        tracker.add_pending("eval".into(), PendingJob::Eval(eval));
+        let (jobs, _, complete) = tracker.bootstrap_pending(&scope, 1, usize::MAX).unwrap();
+        assert!(complete);
+        assert_eq!(jobs.len(), 1);
+        assert!(matches!(
+            jobs[0],
+            crate::bootstrap::BootstrapJob::Evaluation {
+                requirement: gradient_pool::EvaluationRequirement {
+                    eval: true,
+                    network: true,
+                    secrets: true
+                },
+                ..
+            }
+        ));
+        tracker.clusters.add(
+            crate::cluster::book::book_tests::member_of(gradient_types::ClusterJobId::now_v7(), 1),
+            "cluster".into(),
+            PendingJob::Eval(crate::test_jobs::eval_job(project)),
+        );
+        assert!(!tracker.bootstrap_pending(&scope, 1, usize::MAX).unwrap().2);
+        assert!(tracker.bootstrap_pending(&scope, 1, 0).is_err());
+        assert!(
+            tracker
+                .bootstrap_pending(&HashSet::new(), 1, usize::MAX)
+                .unwrap()
+                .2
+        );
+    }
+
+    #[test]
+    fn bootstrap_capture_bounds_signing_policy_payload_even_without_key_strings() {
+        let project = ProjectId::now_v7();
+        let mut tracker = JobTracker::new();
+        let job = crate::test_jobs::substitution_job(
+            project,
+            DerivationBuildId::now_v7(),
+            vec![
+                None;
+                crate::bootstrap::MAX_BOOTSTRAP_BYTES / std::mem::size_of::<Option<String>>() + 1
+            ],
+        );
+        tracker.add_pending("transfer".into(), PendingJob::Build(job));
+        assert!(
+            tracker
+                .bootstrap_pending(&HashSet::from([project]), 1, usize::MAX)
+                .is_err()
+        );
     }
 
     fn fetch_eval_job(peer: ProjectId) -> PendingJob {

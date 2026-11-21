@@ -6,6 +6,7 @@
 
 pub mod actor;
 mod assessment_memo;
+pub mod bootstrap;
 pub mod build;
 pub mod build_history;
 pub mod buildability;
@@ -255,7 +256,7 @@ impl Scheduler {
         &self,
         projects: std::collections::HashSet<ProjectId>,
     ) -> anyhow::Result<capacity::BuildCapacitySnapshot> {
-        self.capture_build_capacity(projects, vec![], None, None)
+        self.capture_build_capacity(projects, vec![], capacity::BuildCapacityCapture::default())
             .await
     }
 
@@ -263,17 +264,15 @@ impl Scheduler {
         &self,
         projects: std::collections::HashSet<ProjectId>,
         tracked_workers: Vec<String>,
-        limits: Option<capacity::BuildCapacityLimits>,
-        after: Option<capacity::BuildCapacityCursor>,
+        capture: capacity::BuildCapacityCapture,
     ) -> anyhow::Result<capacity::BuildCapacitySnapshot> {
         let instance = **self.scoring.instance.load();
         self.call(|reply| SchedulerMsg::BuildCapacitySnapshot {
             projects,
             instance,
             draining: self.draining.clone(),
-            limits,
+            capture,
             tracked_workers,
-            after,
             reply,
         })
         .await?
@@ -286,7 +285,7 @@ impl Scheduler {
         projects: std::collections::HashSet<ProjectId>,
         profiles: Vec<capacity::BuildCapacityProfile>,
     ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
-        self.capture_build_capacity_assessment(projects, profiles, vec![], None, None)
+        self.capture_build_capacity_assessment(projects, profiles, vec![], None, None, None)
             .await
     }
 
@@ -297,7 +296,7 @@ impl Scheduler {
         profiles: Vec<capacity::BuildCapacityProfile>,
         limits: capacity::BuildCapacityLimits,
     ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
-        self.capture_build_capacity_assessment(projects, profiles, vec![], Some(limits), None)
+        self.capture_build_capacity_assessment(projects, profiles, vec![], Some(limits), None, None)
             .await
     }
 
@@ -314,6 +313,7 @@ impl Scheduler {
             profiles,
             tracked_profiles,
             Some(limits),
+            None,
             None,
         )
         .await
@@ -334,6 +334,28 @@ impl Scheduler {
             tracked_profiles,
             Some(limits),
             after,
+            None,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn assess_joint_capacity_page(
+        &self,
+        projects: std::collections::HashSet<ProjectId>,
+        profiles: Vec<capacity::BuildCapacityProfile>,
+        tracked_profiles: Vec<capacity::BuildCapacityProfile>,
+        limits: capacity::BuildCapacityLimits,
+        after: Option<capacity::BuildCapacityCursor>,
+        bootstrap: bootstrap::BootstrapCapacityProfiles,
+    ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
+        self.capture_build_capacity_assessment(
+            projects,
+            profiles,
+            tracked_profiles,
+            Some(limits),
+            after,
+            Some(bootstrap),
         )
         .await
     }
@@ -345,20 +367,92 @@ impl Scheduler {
         tracked_profiles: Vec<capacity::BuildCapacityProfile>,
         limits: Option<capacity::BuildCapacityLimits>,
         after: Option<capacity::BuildCapacityCursor>,
+        bootstrap: Option<bootstrap::BootstrapCapacityProfiles>,
     ) -> anyhow::Result<capacity::BuildCapacityAssessment> {
         capacity::BuildCapacityProfile::validate_all(&profiles)?;
         capacity::BuildCapacityProfile::validate_all(&tracked_profiles)?;
+        if let Some(bootstrap) = &bootstrap {
+            bootstrap::CapabilityProfile::validate_all(&bootstrap.profiles)?;
+            bootstrap::CapabilityProfile::validate_tracked(&bootstrap.tracked_profiles)?;
+        }
+        let observation = if bootstrap.is_some() {
+            Some(
+                bootstrap::BootstrapObservation::capture(
+                    &self.db.worker_db,
+                    &projects,
+                    &self.input_waits,
+                    limits.map_or(usize::MAX, |limits| limits.scanned_jobs),
+                    limits.map_or(usize::MAX, |limits| limits.scanned_workers),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let mut tracked_workers = tracked_profiles
+            .iter()
+            .map(|profile| profile.worker_id.clone())
+            .collect::<Vec<_>>();
+        if let Some(bootstrap) = &bootstrap {
+            tracked_workers.extend(
+                bootstrap
+                    .tracked_profiles
+                    .iter()
+                    .map(|profile| profile.worker_id.clone()),
+            );
+        }
         let snapshot = self
             .capture_build_capacity(
                 projects.clone(),
-                tracked_profiles
-                    .iter()
-                    .map(|profile| profile.worker_id.clone())
-                    .collect(),
-                limits,
-                after,
+                tracked_workers,
+                capacity::BuildCapacityCapture {
+                    limits,
+                    after,
+                    bootstrap: bootstrap.is_some(),
+                },
             )
             .await?;
+        let bootstrap = bootstrap.zip(observation).map(|(extra, observation)| {
+            let mut candidates = profiles
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, profile)| bootstrap::BootstrapCapacityProfile {
+                    profile: profile.into(),
+                    build_profile_index: Some(index),
+                })
+                .collect::<Vec<_>>();
+            candidates.extend(extra.profiles.into_iter().map(|profile| {
+                bootstrap::BootstrapCapacityProfile {
+                    profile,
+                    build_profile_index: None,
+                }
+            }));
+            let mut tracked = tracked_profiles
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, profile)| bootstrap::BootstrapTrackedWorker {
+                    connected: snapshot.connected_workers.contains(&profile.worker_id),
+                    profile: profile.into(),
+                    build_tracked_index: Some(index),
+                })
+                .collect::<Vec<_>>();
+            tracked.extend(extra.tracked_profiles.into_iter().map(|profile| {
+                bootstrap::BootstrapTrackedWorker {
+                    connected: snapshot.connected_workers.contains(&profile.worker_id),
+                    profile,
+                    build_tracked_index: None,
+                }
+            }));
+            bootstrap::BootstrapInputs {
+                observation,
+                profiles: candidates,
+                tracked_workers: tracked,
+                projects: projects.clone(),
+                policy: Arc::clone(&self.job_policy),
+            }
+        });
         let profiles = profiles
             .into_iter()
             .map(|profile| profile.prospective_worker(&projects, &self.job_policy))
@@ -371,6 +465,7 @@ impl Scheduler {
             snapshot,
             profiles,
             tracked_profiles,
+            bootstrap,
         })
     }
 

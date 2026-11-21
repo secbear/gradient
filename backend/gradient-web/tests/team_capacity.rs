@@ -22,6 +22,7 @@ use gradient_scheduler::actor::WorkerMetrics;
 use gradient_scheduler::jobs::{PendingBuildJob, PendingJob, Reattached, build_job_key};
 use gradient_test_support::state::TestState;
 use gradient_test_support::web::{bearer, signed_in, signed_in_as, with_auth};
+use gradient_types::waiting_reason::{EvalCapability, WaitingReason};
 use gradient_util::shutdown::Shutdown;
 use gradient_wire::types::{
     BuildJob, BuildRequirement, BuildSpec, BuildSpecKind, GradientCapabilities, JobKind,
@@ -29,7 +30,7 @@ use gradient_wire::types::{
 };
 use sea_orm::{DatabaseConnection, MockDatabase};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -37,6 +38,9 @@ const URL: &str = "/api/v1/teams/platform/workers/capacity-assessment";
 const INTENDED: &str = "7e000000-0000-0000-0000-0000000000fa";
 const OTHER_INTENDED: &str = "7e000000-0000-0000-0000-0000000000fb";
 const LIVE: &str = "7e000000-0000-0000-0000-0000000000fc";
+const WAITING_EVALUATION: uuid::Uuid = uuid::uuid!("7e000000-0000-0000-0000-0000000000fd");
+const HTTPS_REPOSITORY: &str = "https://example.invalid/private-waiting-repository";
+const SSH_REPOSITORY: &str = "git+ssh://git@example.invalid/private-waiting-repository";
 
 fn scoped_db(role: TeamRole, superuser: bool) -> (MockDatabase, String) {
     let (db, auth) = if superuser {
@@ -163,6 +167,126 @@ fn profile(name: &str, identity: &str, ram_mb: u64) -> Value {
     })
 }
 
+fn joint_builder(name: &str, identity: &str) -> Value {
+    let mut builder = profile(name, identity, 60_000);
+    for flag in ["eval", "secrets", "exec"] {
+        builder["profile"]["capabilities"][flag] = json!(true);
+    }
+    builder["registration"] = json!({
+        "enable_build": true,
+        "enable_network": true,
+        "enable_eval": true,
+        "enable_secrets": true,
+        "enable_exec": true
+    });
+    builder
+}
+
+fn bootstrap_profile(name: &str, identity: &str) -> Value {
+    json!({
+        "profile": {
+            "name": name,
+            "worker_id": identity,
+            "capabilities": {
+                "core": true,
+                "cache": true,
+                "federate": true,
+                "build": false,
+                "eval": true,
+                "network": false,
+                "secrets": false,
+                "exec": false
+            },
+            "resources": {
+                "architectures": [],
+                "system_features": [],
+                "max_concurrent_builds": 0,
+                "cpu_count": 0,
+                "ram_total_mb": 0,
+                "cpu_core_score": 0
+            }
+        },
+        "registration": {
+            "enable_build": false,
+            "enable_eval": true,
+            "enable_network": false,
+            "enable_secrets": false,
+            "enable_exec": false
+        }
+    })
+}
+
+fn waiting_db(project: ProjectId, capability: EvalCapability) -> DatabaseConnection {
+    waiting_source_db(project, capability, HTTPS_REPOSITORY, 0)
+}
+
+fn waiting_source_db(
+    project: ProjectId,
+    capability: EvalCapability,
+    repository: &str,
+    pre_warm_reads: usize,
+) -> DatabaseConnection {
+    let mut db = mock_db();
+    for _ in 0..pre_warm_reads {
+        db = db.append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()]);
+    }
+    db.append_exec_results([exec_ok()])
+        .append_query_results([vec![BTreeMap::<&str, sea_orm::Value>::from([
+            ("evaluation", WAITING_EVALUATION.into()),
+            ("project", project.into_inner().into()),
+            ("repository", repository.into()),
+            (
+                "reason",
+                WaitingReason::eval_workers(capability, 0).to_json().into(),
+            ),
+        ])]])
+        .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+        .into_connection()
+}
+
+fn assert_waiting_read(db: &DatabaseConnection, project: ProjectId, prior_reads: usize) {
+    let log = db.clone().into_transaction_log();
+    assert_eq!(log.len(), prior_reads + 1);
+    let statements = all_statements(log);
+    assert_eq!(statements.len(), prior_reads + 5);
+    assert!(
+        statements[..prior_reads]
+            .iter()
+            .all(|query| query.sql.starts_with("SELECT"))
+    );
+    let statements = &statements[prior_reads..];
+    assert_eq!(statements[0].sql, "BEGIN");
+    assert_eq!(statements[1].sql, "SET LOCAL statement_timeout = '2s'");
+    assert_eq!(statements[4].sql, "ROLLBACK");
+    let query = &statements[2];
+    assert!(query.sql.starts_with("SELECT"));
+    assert!(query.sql.contains(r#"FROM "evaluation""#));
+    assert!(query.sql.contains(r#"JOIN "task""#));
+    assert!(query.sql.contains("eval_workers"));
+    let exec_query = &statements[3];
+    assert!(exec_query.sql.starts_with("SELECT"));
+    assert!(exec_query.sql.contains(r#"FROM "exec_job""#));
+    assert!(exec_query.sql.contains(r#"JOIN "evaluation""#));
+    assert!(exec_query.sql.contains(r#"JOIN "task""#));
+    assert!(
+        exec_query
+            .values
+            .as_ref()
+            .expect("queued-exec query parameters")
+            .0
+            .contains(&project.into_inner().into())
+    );
+    assert!(query.sql.contains(r#""status" ="#));
+    assert!(
+        query
+            .values
+            .as_ref()
+            .expect("waiting-worker query parameters")
+            .0
+            .contains(&project.into_inner().into())
+    );
+}
+
 fn page_state() -> (tempfile::NamedTempFile, TestState) {
     let key = tempfile::NamedTempFile::new().expect("create capacity cursor key");
     std::fs::write(key.path(), b"capacity-test-key-32-bytes-padding")
@@ -255,18 +379,47 @@ impl CapacityTest {
     }
 
     async fn with_state(builder: TestState, db: MockDatabase, auth: String) -> Self {
+        Self::with_worker_db(builder, db, auth, empty_db()).await
+    }
+
+    async fn with_worker_db(
+        builder: TestState,
+        db: MockDatabase,
+        auth: String,
+        worker_db: DatabaseConnection,
+    ) -> Self {
+        Self::with_worker_db_transport(builder, db, auth, worker_db, false).await
+    }
+
+    async fn with_worker_db_transport(
+        builder: TestState,
+        db: MockDatabase,
+        auth: String,
+        worker_db: DatabaseConnection,
+        http: bool,
+    ) -> Self {
         let web_db = db.into_connection();
-        let worker_db = empty_db();
         let state = builder
             .web_db(web_db.clone())
             .worker_db(worker_db.clone())
             .build();
         let shutdown = state.shutdown.clone();
         let scheduler = Arc::new(Scheduler::new(Arc::clone(&state)));
-        let server = TestServer::new(
-            gradient_web::create_router_with_scheduler(state, Arc::clone(&scheduler))
-                .expect("router"),
-        );
+        let core = scheduler.spawn_core(None).await.expect("scheduler core");
+        let stopped = shutdown.token();
+        shutdown.spawn(async move {
+            stopped.cancelled().await;
+            core.stop_and_wait(None, None)
+                .await
+                .expect("stop scheduler core");
+        });
+        let router = gradient_web::build_router_with_scheduler(state, Arc::clone(&scheduler))
+            .expect("router");
+        let server = if http {
+            TestServer::builder().http_transport().build(router)
+        } else {
+            TestServer::new(router)
+        };
         scheduler
             .build_capacity_snapshot(HashSet::new())
             .await
@@ -568,6 +721,69 @@ async fn invalid_profiles_and_unknown_fields_are_refused_before_registration_loo
             StatusCode::UNPROCESSABLE_ENTITY,
         ));
     }
+    let joint = json!({
+        "profiles": [joint_builder("builder", INTENDED)],
+        "bootstrap": { "profiles": [bootstrap_profile("eval", OTHER_INTENDED)] }
+    });
+    let mut missing = joint.clone();
+    missing["profiles"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("registration");
+    cases.push((missing, StatusCode::BAD_REQUEST));
+    for pointer in [
+        "/profiles/0/registration",
+        "/bootstrap/profiles/0/registration",
+    ] {
+        let mut body = joint.clone();
+        body.pointer_mut(pointer).unwrap()["unknown_capacity_field"] = json!(true);
+        cases.push((body, StatusCode::UNPROCESSABLE_ENTITY));
+        for flag in [
+            "enable_build",
+            "enable_network",
+            "enable_eval",
+            "enable_secrets",
+            "enable_exec",
+        ] {
+            let mut body = joint.clone();
+            body.pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(flag);
+            cases.push((body, StatusCode::UNPROCESSABLE_ENTITY));
+        }
+    }
+    for pointer in [
+        "/bootstrap",
+        "/bootstrap/profiles/0",
+        "/bootstrap/profiles/0/profile",
+        "/bootstrap/profiles/0/profile/resources",
+    ] {
+        let mut body = joint.clone();
+        body.pointer_mut(pointer).unwrap()["unknown_capacity_field"] = json!(true);
+        cases.push((body, StatusCode::UNPROCESSABLE_ENTITY));
+    }
+    for (pointer, value) in [
+        (
+            "/bootstrap/profiles/0/profile/worker_id",
+            json!("not-a-uuid"),
+        ),
+        ("/bootstrap/profiles/0/profile/name", json!(" ")),
+        (
+            "/bootstrap/profiles/0/registration/enable_eval",
+            json!(false),
+        ),
+        ("/profiles/0/registration/enable_build", json!(false)),
+    ] {
+        let mut body = joint.clone();
+        *body.pointer_mut(pointer).unwrap() = value;
+        cases.push((body, StatusCode::BAD_REQUEST));
+    }
+    let mut no_fetch_slots = joint.clone();
+    no_fetch_slots["bootstrap"]["profiles"][0]["profile"]["capabilities"]["network"] = json!(true);
+    no_fetch_slots["bootstrap"]["profiles"][0]["registration"]["enable_network"] = json!(true);
+    cases.push((no_fetch_slots, StatusCode::BAD_REQUEST));
     for (body, expected) in cases {
         let (db, auth) = scoped_db(TeamRole::Admin, false);
         let test = CapacityTest::start(db, auth).await;
@@ -1879,5 +2095,656 @@ async fn a_missing_cursor_key_refuses_only_paged_assessments() {
     let body: Value = paged.json();
     assert!(body["message"].get("total_ready_builds").is_none());
     assert_eq!(test.scheduler.pending_job_count().await, 1);
+    test.stop().await;
+}
+
+#[tokio::test]
+async fn bootstrap_role_profiles_accept_native_flags_without_build_resources() {
+    for (capability, repository, network, secrets, fits) in [
+        (
+            EvalCapability::Eval,
+            HTTPS_REPOSITORY,
+            false,
+            false,
+            vec![true, false],
+        ),
+        (
+            EvalCapability::Eval,
+            HTTPS_REPOSITORY,
+            true,
+            false,
+            vec![false, true],
+        ),
+        (
+            EvalCapability::Network,
+            HTTPS_REPOSITORY,
+            true,
+            false,
+            vec![true],
+        ),
+        (
+            EvalCapability::Network,
+            SSH_REPOSITORY,
+            true,
+            false,
+            vec![false],
+        ),
+        (
+            EvalCapability::Secrets,
+            SSH_REPOSITORY,
+            true,
+            true,
+            vec![true],
+        ),
+        (
+            EvalCapability::Secrets,
+            HTTPS_REPOSITORY,
+            true,
+            false,
+            vec![true],
+        ),
+        (
+            EvalCapability::Eval,
+            SSH_REPOSITORY,
+            true,
+            true,
+            vec![false, true],
+        ),
+    ] {
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let test = CapacityTest::with_worker_db(
+            TestState::new(),
+            unregistered(grants(db, &[project_id()]), 1),
+            auth,
+            waiting_source_db(project_id(), capability, repository, 0),
+        )
+        .await;
+        let mut role = bootstrap_profile("role", INTENDED);
+        role["profile"]["capabilities"]["eval"] = json!(!network);
+        role["profile"]["capabilities"]["network"] = json!(network);
+        role["profile"]["capabilities"]["secrets"] = json!(secrets);
+        role["profile"]["resources"]["max_concurrent_builds"] = json!(usize::from(network));
+        role["registration"]["enable_eval"] = json!(!network);
+        role["registration"]["enable_network"] = json!(network);
+        role["registration"]["enable_secrets"] = json!(secrets);
+        let res = test
+            .post(&json!({ "profiles": [], "bootstrap": { "profiles": [role] } }))
+            .await;
+        res.assert_status_ok();
+        let body: Value = res.json();
+        let bootstrap = &body["message"]["bootstrap"];
+        assert_eq!(bootstrap["complete"], true);
+        assert_eq!(bootstrap["profiles"][0]["build_profile_index"], Value::Null);
+        let returned = &bootstrap["profiles"][0]["profile"];
+        for flag in ["core", "cache", "federate"] {
+            assert_eq!(returned["capabilities"][flag], true);
+        }
+        assert_eq!(returned["capabilities"]["build"], false);
+        assert_eq!(returned["resources"]["cpu_count"], 0);
+        assert_eq!(returned["resources"]["ram_total_mb"], 0);
+        assert_eq!(bootstrap["demands"].as_array().unwrap().len(), fits.len());
+        for (demand, fits) in bootstrap["demands"].as_array().unwrap().iter().zip(fits) {
+            assert_eq!(
+                demand,
+                &json!({
+                    "kind": "evaluation",
+                    "available": false,
+                    "profiles": [fits],
+                    "tracked_workers": []
+                })
+            );
+        }
+        assert_eq!(body["message"]["profiles"], json!([]));
+        assert_no_registration_or_dispatch(&test.web_db);
+        assert_no_registration_or_dispatch(&test.worker_db);
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn joint_profile_limits_combine_rosters_and_keep_the_http_byte_bound() {
+    for builders in [15, 16] {
+        let profiles: Vec<_> = (0..builders)
+            .map(|index| {
+                joint_builder(
+                    &format!("builder-{index}"),
+                    &uuid::Uuid::from_u128(index + 1).to_string(),
+                )
+            })
+            .collect();
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let db = if builders == 15 {
+            unregistered(grants(db, &[project_id()]), 16)
+        } else {
+            db
+        };
+        let test = CapacityTest::with_worker_db(
+            TestState::new(),
+            db,
+            auth,
+            waiting_db(project_id(), EvalCapability::Eval),
+        )
+        .await;
+        let res = test
+            .post(&json!({
+                "profiles": profiles,
+                "bootstrap": { "profiles": [bootstrap_profile("eval", INTENDED)] }
+            }))
+            .await;
+        if builders == 15 {
+            res.assert_status_ok();
+            let body: Value = res.json();
+            assert_eq!(
+                body["message"]["bootstrap"]["profiles"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                16
+            );
+            assert_eq!(
+                body["message"]["bootstrap"]["demands"][0]["profiles"],
+                json!(vec![true; 16])
+            );
+            assert_eq!(
+                body["message"]["bootstrap"]["demands"][1]["profiles"],
+                json!((0..16).map(|index| index < 15).collect::<Vec<_>>())
+            );
+        } else {
+            res.assert_status(StatusCode::BAD_REQUEST);
+        }
+        test.stop().await;
+    }
+    for total in [256, 257] {
+        let roles: Vec<_> = (1..total)
+            .map(|index| {
+                bootstrap_profile(
+                    &format!("role-{index}"),
+                    &uuid::Uuid::from_u128(index).to_string(),
+                )
+            })
+            .collect();
+        let body = json!({
+            "profiles": [],
+            "tracked_profiles": [joint_builder("starting-builder", INTENDED)],
+            "bootstrap": { "profiles": [], "tracked_profiles": roles }
+        });
+        assert!(serde_json::to_vec(&body).unwrap().len() > 64 * 1024);
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let test = CapacityTest::start(db, auth).await;
+        test.post(&body)
+            .await
+            .assert_status(StatusCode::PAYLOAD_TOO_LARGE);
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn joint_rosters_refuse_duplicate_canonical_worker_ids() {
+    for tracked in [false, true] {
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let db = grants(db, &[project_id()]);
+        let db = if tracked { db } else { unregistered(db, 1) };
+        let test = CapacityTest::start(db, auth).await;
+        let mut body = json!({
+            "profiles": [],
+            "bootstrap": { "profiles": [] }
+        });
+        let role = bootstrap_profile("role", &INTENDED.to_uppercase());
+        if tracked {
+            body["tracked_profiles"] = json!([joint_builder("builder", INTENDED)]);
+            body["bootstrap"]["tracked_profiles"] = json!([role]);
+        } else {
+            body["profiles"] = json!([joint_builder("builder", INTENDED)]);
+            body["bootstrap"]["profiles"] = json!([role]);
+        }
+        test.post(&body)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        assert_eq!(test.scheduler.worker_count().await, 0);
+        assert_no_registration_or_dispatch(&test.web_db);
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn joint_tracked_roles_intersect_all_five_saved_registration_flags() {
+    for flag in ["build", "network", "eval", "secrets", "exec", "all"] {
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let mut saved = team_worker::Model {
+            enable_eval: true,
+            enable_secrets: true,
+            enable_exec: true,
+            ..team_registration(INTENDED)
+        };
+        match flag {
+            "build" => saved.enable_build = false,
+            "network" => saved.enable_network = false,
+            "eval" => saved.enable_eval = false,
+            "secrets" => saved.enable_secrets = false,
+            "exec" => saved.enable_exec = false,
+            "all" => {
+                saved.enable_build = false;
+                saved.enable_network = false;
+                saved.enable_eval = false;
+                saved.enable_secrets = false;
+                saved.enable_exec = false;
+            }
+            _ => unreachable!(),
+        }
+        let test = CapacityTest::with_worker_db(
+            TestState::new(),
+            grants(db, &[project_id()]).append_query_results([vec![saved]]),
+            auth,
+            waiting_db(project_id(), EvalCapability::Eval),
+        )
+        .await;
+        let builder = joint_builder("role", INTENDED);
+        let res = test
+            .post(&json!({
+                "profiles": [],
+                "bootstrap": { "profiles": [], "tracked_profiles": [{
+                    "profile": builder["profile"],
+                    "registration": builder["registration"]
+                }] }
+            }))
+            .await;
+        res.assert_status_ok();
+        let body: Value = res.json();
+        let tracked = &body["message"]["bootstrap"]["tracked_workers"][0];
+        assert_eq!(tracked["connected"], false);
+        assert_eq!(tracked["build_tracked_index"], Value::Null);
+        for other in ["build", "network", "eval", "secrets", "exec"] {
+            assert_eq!(
+                tracked["profile"]["capabilities"][other],
+                other != flag && flag != "all"
+            );
+        }
+        assert_eq!(
+            body["message"]["bootstrap"]["demands"][0]["tracked_workers"],
+            json!([!matches!(flag, "eval" | "all")])
+        );
+        assert_eq!(
+            body["message"]["bootstrap"]["demands"][1]["tracked_workers"],
+            json!([!matches!(flag, "network" | "all")])
+        );
+        assert_eq!(body["message"]["bootstrap"]["complete"], true);
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_narrows_tracked_builders_without_changing_legacy_permissions() {
+    for joint in [false, true] {
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let test = CapacityTest::with_worker_db(
+            TestState::new(),
+            grants(db, &[project_id()]).append_query_results([vec![team_worker::Model {
+                enable_network: false,
+                ..team_registration(INTENDED)
+            }]]),
+            auth,
+            if joint {
+                waiting_db(project_id(), EvalCapability::Eval)
+            } else {
+                empty_db()
+            },
+        )
+        .await;
+        let mut body = json!({
+            "profiles": [],
+            "tracked_profiles": [joint_builder("starting", INTENDED)]
+        });
+        if joint {
+            body["bootstrap"] = json!({ "profiles": [] });
+        }
+        let res = test.post(&body).await;
+        res.assert_status_ok();
+        let body: Value = res.json();
+        let capabilities = &body["message"]["tracked_workers"][0]["profile"]["capabilities"];
+        assert_eq!(capabilities["build"], true);
+        assert_eq!(capabilities["network"], false);
+        for flag in ["eval", "secrets", "exec"] {
+            assert_eq!(capabilities[flag], !joint);
+        }
+        if joint {
+            assert_eq!(
+                body["message"]["bootstrap"]["tracked_workers"][0]["build_tracked_index"],
+                0
+            );
+            assert_eq!(
+                body["message"]["bootstrap"]["demands"][0]["tracked_workers"],
+                json!([false])
+            );
+            assert_eq!(
+                body["message"]["bootstrap"]["demands"][1]["tracked_workers"],
+                json!([false])
+            );
+        } else {
+            assert!(body["message"].get("bootstrap").is_none());
+        }
+        test.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_uses_native_policy_scoped_ready_supply_and_private_demands() {
+    for (ready, scoped, restricted, available) in [
+        (false, true, false, false),
+        (true, false, false, false),
+        (true, true, true, false),
+        (true, true, false, true),
+    ] {
+        let outside = ProjectId::now_v7();
+        let (db, auth) = scoped_db(TeamRole::Admin, false);
+        let state = if restricted {
+            TestState::new().worker_job_policy(Arc::new(OnlyIntendedWorker))
+        } else {
+            TestState::new()
+        };
+        let test = CapacityTest::with_worker_db(
+            state,
+            unregistered(grants(db, &[project_id()]), 1),
+            auth,
+            waiting_source_db(
+                project_id(),
+                EvalCapability::Eval,
+                HTTPS_REPOSITORY,
+                1 + usize::from(ready),
+            ),
+        )
+        .await;
+        let mut download = build(project_id(), 0, BuildEstimate::default());
+        download.job.build.kind = BuildSpecKind::Download;
+        let hidden = [
+            download.derivation_build.to_string(),
+            download.derivation.to_string(),
+            download.evaluation_id.to_string(),
+            WAITING_EVALUATION.to_string(),
+            gradient_fixtures::ids::task_id().to_string(),
+            project_id().to_string(),
+            outside.to_string(),
+            LIVE.into(),
+            "private-build-name".into(),
+            "aaaa-private-build.drv".into(),
+            HTTPS_REPOSITORY.into(),
+        ];
+        test.enqueue(download).await;
+        let mut foreign = build(outside, 1, BuildEstimate::default());
+        foreign.job.build.kind = BuildSpecKind::Download;
+        test.enqueue(foreign).await;
+        let (tx, mut signals) = mpsc::unbounded_channel();
+        test.scheduler
+            .reattach_worker_with_readiness(
+                LIVE,
+                GradientCapabilities {
+                    eval: true,
+                    network: true,
+                    ..Default::default()
+                },
+                HashSet::from([if scoped { project_id() } else { outside }]),
+                Arc::new(tx),
+                vec![],
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        test.scheduler
+            .update_worker_capabilities(
+                LIVE,
+                WorkerProfile {
+                    max_concurrent_builds: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if ready {
+            let port = test.scheduler.worker_port(LIVE).await.unwrap();
+            test.scheduler
+                .update_worker_health(
+                    LIVE,
+                    port,
+                    WorkerHealth {
+                        checks: vec![WorkerHealthCheck {
+                            name: "nix-store".into(),
+                            status: WorkerCheckStatus::Passed,
+                            healthy: true,
+                        }],
+                        valid_for_secs: 86_400,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        while signals.try_recv().is_ok() {}
+        let before = test.scheduler.metrics_snapshot().await;
+        let mut role = bootstrap_profile("eval-and-network", INTENDED);
+        role["profile"]["capabilities"]["network"] = json!(true);
+        role["profile"]["resources"]["max_concurrent_builds"] = json!(1);
+        role["registration"]["enable_network"] = json!(true);
+        let res = test
+            .post(&json!({
+                "profiles": [],
+                "bootstrap": { "profiles": [role] }
+            }))
+            .await;
+        res.assert_status_ok();
+        for hidden in hidden {
+            assert!(!res.text().contains(&hidden), "response disclosed {hidden}");
+        }
+        let body: Value = res.json();
+        let message = &body["message"];
+        assert_eq!(message["workers"], json!([]));
+        assert_eq!(message["total_ready_builds"], 0);
+        assert_eq!(message["bootstrap"]["complete"], true);
+        let demands = message["bootstrap"]["demands"].as_array().unwrap();
+        assert_eq!(demands.len(), 3);
+        assert_eq!(
+            demands
+                .iter()
+                .map(|d| d["kind"].as_str().unwrap())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["download", "evaluation"])
+        );
+        for demand in demands {
+            assert_eq!(demand["available"], available);
+            assert_eq!(demand["profiles"], json!([!restricted]));
+            assert_eq!(demand["tracked_workers"], json!([]));
+        }
+        assert_eq!(test.scheduler.metrics_snapshot().await, before);
+        assert!(signals.try_recv().is_err());
+        assert_waiting_read(&test.worker_db, project_id(), 1 + usize::from(ready));
+        assert_no_registration_or_dispatch(&test.web_db);
+        test.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn joint_http_capacity_correlates_native_builder_and_connected_tracking() {
+    let (_key, state) = page_state();
+    let (db, auth) = scoped_key_db(TeamRole::Admin, false);
+    let test = CapacityTest::with_worker_db_transport(
+        state,
+        unregistered(
+            grants(db, &[project_id()]).append_query_results([vec![team_worker::Model {
+                enable_eval: true,
+                enable_secrets: true,
+                enable_exec: true,
+                ..team_registration(LIVE)
+            }]]),
+            2,
+        ),
+        auth,
+        waiting_source_db(project_id(), EvalCapability::Eval, HTTPS_REPOSITORY, 1),
+        true,
+    )
+    .await;
+    test.enqueue(build(
+        project_id(),
+        0,
+        BuildEstimate::fixed(Some(40_000), Some(60_000), 5),
+    ))
+    .await;
+    let mut signals = test.worker(LIVE, HashSet::from([project_id()])).await;
+    while signals.try_recv().is_ok() {}
+    let before = test.scheduler.metrics_snapshot().await;
+    let res = test
+        .post(&json!({
+            "profiles": [joint_builder("builder", INTENDED)],
+            "tracked_profiles": [joint_builder("connected", LIVE)],
+            "bootstrap": { "profiles": [bootstrap_profile("eval", OTHER_INTENDED)] },
+            "build_page": {},
+            "include_waiting_builds": true
+        }))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    let message = &body["message"];
+    assert_eq!(message["total_ready_builds"], 1);
+    assert_eq!(
+        message["builds"][0]["profiles"][0]["prediction_fit"],
+        "fits"
+    );
+    assert_eq!(message["tracked_workers"][0]["connected"], true);
+    assert_eq!(message["tracked_workers"][0]["worker_index"], 0);
+    assert_eq!(message["builds"][0]["tracked_workers"], json!([null]));
+    assert_eq!(
+        message["bootstrap"]["profiles"][0]["build_profile_index"],
+        0
+    );
+    assert_eq!(
+        message["bootstrap"]["profiles"][1]["build_profile_index"],
+        Value::Null
+    );
+    assert_eq!(
+        message["bootstrap"]["tracked_workers"][0]["connected"],
+        true
+    );
+    assert_eq!(
+        message["bootstrap"]["demands"],
+        json!([
+            { "kind": "evaluation", "available": false, "profiles": [true, true], "tracked_workers": [false] },
+            { "kind": "evaluation", "available": true, "profiles": [true, false], "tracked_workers": [false] }
+        ])
+    );
+    assert_eq!(test.scheduler.metrics_snapshot().await, before);
+    assert!(signals.try_recv().is_err());
+    assert_no_registration_or_dispatch(&test.worker_db);
+    assert_no_registration_or_dispatch(&test.web_db);
+    test.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the joint-preview controller example"]
+async fn joint_preview_controller_uses_the_native_http_capacity_route() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The external integration harness supplies the test driver path."
+    )]
+    let driver = std::env::var_os("GRADIENT_JOINT_PREVIEW_DRIVER")
+        .expect("GRADIENT_JOINT_PREVIEW_DRIVER must point to the built joint-preview example");
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    let api_key = directory.path().join("gteam.key");
+    let token = directory.path().join("absent-kubernetes-token");
+    std::fs::write(&api_key, format!("GTEAM{}", "c".repeat(64))).unwrap();
+    let (_key, state) = page_state();
+    let (db, auth) = scoped_key_db(TeamRole::Admin, false);
+    let test = CapacityTest::with_worker_db_transport(
+        state,
+        unregistered(grants(db, &[project_id()]), 2),
+        auth,
+        waiting_db(project_id(), EvalCapability::Eval),
+        true,
+    )
+    .await;
+    test.enqueue(build(
+        project_id(),
+        0,
+        BuildEstimate::fixed(Some(40_000), Some(60_000), 5),
+    ))
+    .await;
+    let before = test.scheduler.metrics_snapshot().await;
+    std::fs::write(&config, serde_json::to_vec(&json!({
+        "listen": "127.0.0.1:8080",
+        "publicUrl": "http://127.0.0.1:8080/",
+        "stateDir": directory.path(),
+        "connections": [{
+            "name": "joint-preview",
+            "team": "platform",
+            "gradientUrl": test.server.server_address().expect("real HTTP address"),
+            "apiKeyFile": api_key,
+            "projects": [project_id()],
+            "maxLaunches": 1,
+            "maxLaunchesPerKind": 1,
+            "workerCapabilities": {
+                "build": true, "network": true, "eval": true, "secrets": false, "exec": false
+            },
+            "kubernetes": {
+                "apiServer": "http://127.0.0.1:9/",
+                "namespace": "joint-preview",
+                "tokenFile": token,
+                "image": "fixture",
+                "pools": {
+                    "builder": {
+                        "system": "x86_64-linux",
+                        "maxJobs": 2,
+                        "buildResources": { "cpuCount": 64, "ramTotalMb": 60_000, "cpuCoreScore": 4000 }
+                    },
+                    "eval": { "system": "x86_64-linux", "maxJobs": 1 }
+                }
+            },
+            "buildScaling": {
+                "mode": "joint_preview",
+                "profiles": ["builder"],
+                "bootstrapProfiles": [{
+                    "pool": "eval",
+                    "capabilities": {
+                        "build": false, "network": false, "eval": true, "secrets": false, "exec": false
+                    }
+                }],
+                "maxNewWorkers": 1,
+                "queueWait": 0,
+                "fallbackRamMb": 64
+            }
+        }]
+    })).unwrap()).unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(driver)
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "--expect-build-workers",
+                "1",
+                "--expect-role-workers",
+                "0",
+                "--expect-deferred-capabilities",
+                "0",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("joint-preview driver timed out")
+    .expect("run joint-preview driver");
+    assert!(
+        output.status.success(),
+        "joint-preview driver failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).expect("typed driver receipt");
+    assert_eq!(
+        receipt,
+        json!({ "build_workers": 1, "role_workers": 0, "deferred_capabilities": 0 })
+    );
+    eprintln!("joint-preview driver invoked: {receipt}");
+    assert_eq!(test.scheduler.metrics_snapshot().await, before);
+    assert_eq!(test.scheduler.pending_job_count().await, 1);
+    assert_eq!(test.scheduler.worker_count().await, 0);
+    assert!(!token.try_exists().unwrap());
+    assert_waiting_read(&test.worker_db, project_id(), 0);
+    assert_no_registration_or_dispatch(&test.web_db);
     test.stop().await;
 }

@@ -43,6 +43,7 @@ pub(crate) use build::pending_build_jobs;
 pub(crate) use build::{admit_startable_moves, build_assign_pass, resync_startable_set};
 #[cfg(test)]
 pub(crate) use eval::assign_queued_evals;
+pub(crate) use eval::flake_job_for_eval_source;
 pub(crate) use eval::pending_eval_jobs;
 pub(crate) use eval::project_id_for_eval;
 #[cfg(test)]

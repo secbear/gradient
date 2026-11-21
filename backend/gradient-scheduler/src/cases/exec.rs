@@ -88,6 +88,45 @@ async fn with_queued_job(evaluation: EvaluationId, spec: ExecSpec) -> SchedulerC
     .await
 }
 
+#[tokio::test]
+async fn bootstrap_reports_database_only_exec_demand_as_partial_in_scope() {
+    use crate::bootstrap::BootstrapCapacityProfiles;
+    use crate::capacity::BuildCapacityLimits;
+    use std::collections::HashSet;
+
+    let evaluation = EvaluationId::now_v7();
+    let case = with_queued_job(evaluation, spec()).await;
+    let project = case.db.project_of(evaluation).await;
+    let outside = ProjectId::now_v7();
+    let before = case.scheduler.metrics_snapshot().await;
+    for scoped in [false, true] {
+        let assessment = case
+            .scheduler
+            .assess_joint_capacity_page(
+                HashSet::from([if scoped { project } else { outside }]),
+                vec![],
+                vec![],
+                BuildCapacityLimits {
+                    builds: 128,
+                    workers: 256,
+                    scanned_jobs: usize::MAX,
+                    scanned_workers: usize::MAX,
+                    assigned_jobs_per_worker: usize::MAX,
+                },
+                None,
+                BootstrapCapacityProfiles::default(),
+            )
+            .await
+            .unwrap();
+        let bootstrap = assessment.assess_bootstrap().unwrap();
+        assert_eq!(bootstrap.complete, !scoped);
+        assert!(bootstrap.demands.is_empty());
+        assert_eq!(case.scheduler.metrics_snapshot().await, before);
+        assert_eq!(the_job(&case).await.status, ExecJobStatus::Queued);
+    }
+    case.finish().await;
+}
+
 async fn dispatched(case: &SchedulerCase) -> (String, DispatchedJobId) {
     case.connect(W1, w_exec(inventory()), &[]).await;
     case.assign_exec_jobs().await;

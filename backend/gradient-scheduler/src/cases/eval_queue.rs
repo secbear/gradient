@@ -34,6 +34,129 @@ const W2: &str = "w2";
 const W3: &str = "w3";
 
 #[tokio::test]
+async fn q27_bootstrap_marks_oversized_waiting_state_incomplete_without_dispatch() {
+    use crate::bootstrap::BootstrapCapacityProfiles;
+    use crate::capacity::BuildCapacityLimits;
+    use std::collections::HashSet;
+
+    let evaluation = EvaluationId::now_v7();
+    let mut reason = WaitingReason::eval_workers(EvalCapability::Eval, 0).to_json();
+    reason["padding"] = serde_json::json!("x".repeat(128 * 1024));
+    let case = SchedulerCase::start(
+        shape()
+            .evalq(evaluation)
+            .evaluation_status(EvaluationStatus::Waiting)
+            .waiting_reason(reason),
+    )
+    .await;
+    let project = case.db.project_of(evaluation).await;
+    let before = case.scheduler.metrics_snapshot().await;
+    let assessment = case
+        .scheduler
+        .assess_joint_capacity_page(
+            HashSet::from([project]),
+            vec![],
+            vec![],
+            BuildCapacityLimits {
+                builds: 128,
+                workers: 256,
+                scanned_jobs: usize::MAX,
+                scanned_workers: usize::MAX,
+                assigned_jobs_per_worker: usize::MAX,
+            },
+            None,
+            BootstrapCapacityProfiles::default(),
+        )
+        .await
+        .unwrap();
+    let bootstrap = assessment.assess_bootstrap().unwrap();
+    assert!(!bootstrap.complete);
+    assert!(bootstrap.demands.is_empty());
+    assert_eq!(case.scheduler.metrics_snapshot().await, before);
+    assert!(case.assignments(&eval_key(evaluation)).await.is_empty());
+    case.finish().await;
+}
+
+#[tokio::test]
+async fn q26_bootstrap_assesses_pre_admission_eval_demand_and_eval_only_supply_without_dispatch() {
+    use crate::bootstrap::{BootstrapCapacityProfiles, BootstrapDemandKind};
+    use crate::capacity::{BuildCapacityLimits, BuildCapacityProfile};
+    use gradient_pool::WorkerProfile;
+    use std::collections::HashSet;
+
+    let (first, second) = (EvaluationId::now_v7(), EvaluationId::now_v7());
+    let case = SchedulerCase::start(shape().evalq(first).evalq(second)).await;
+    case.refresh_waiting_state().await;
+    let project = case.db.project_of(first).await;
+    let profiles = vec![BuildCapacityProfile {
+        name: "both".into(),
+        worker_id: "prospective".into(),
+        capabilities: gradient_wire::types::GradientCapabilities {
+            build: true,
+            eval: true,
+            network: true,
+            ..Default::default()
+        },
+        resources: WorkerProfile {
+            cpu_count: 2,
+            ram_total_mb: 1024,
+            max_concurrent_builds: 2,
+            ..Default::default()
+        },
+    }];
+    let limits = BuildCapacityLimits {
+        builds: 128,
+        workers: 256,
+        scanned_jobs: usize::MAX,
+        scanned_workers: usize::MAX,
+        assigned_jobs_per_worker: usize::MAX,
+    };
+    for available in [false, true] {
+        if available {
+            case.connect(W1, w_eval(), &[project]).await;
+        }
+        let before = case.scheduler.metrics_snapshot().await;
+        let assessment = case
+            .scheduler
+            .assess_joint_capacity_page(
+                HashSet::from([project]),
+                profiles.clone(),
+                vec![],
+                limits,
+                None,
+                BootstrapCapacityProfiles::default(),
+            )
+            .await
+            .unwrap();
+        let bootstrap = assessment.assess_bootstrap().unwrap();
+        assert!(bootstrap.complete);
+        assert_eq!(bootstrap.demands.len(), 2);
+        assert_eq!(bootstrap.demands[0].kind, BootstrapDemandKind::Evaluation);
+        assert_eq!(bootstrap.demands[0].available, available);
+        assert_eq!(bootstrap.demands[0].profiles, vec![true]);
+        assert!(!bootstrap.demands[1].available);
+        assert_eq!(bootstrap.demands[1].profiles, vec![true]);
+        assert_eq!(bootstrap.profiles[0].build_profile_index, Some(0));
+        assert!(assessment.snapshot.workers.is_empty());
+        assert_eq!(case.scheduler.metrics_snapshot().await, before);
+        assert!(case.assignments(&eval_key(first)).await.is_empty());
+        let json = serde_json::to_string(&bootstrap).unwrap();
+        for hidden in [
+            first.to_string(),
+            second.to_string(),
+            project.to_string(),
+            W1.into(),
+        ] {
+            assert!(
+                !json.contains(&hidden),
+                "bootstrap response disclosed {hidden}"
+            );
+        }
+    }
+    case.finish().await;
+}
+
+#[tokio::test]
 async fn q01_a_queued_evaluation_becomes_one_pending_job_with_wildcards_and_overrides() {
     let e1 = EvaluationId::now_v7();
     let case = SchedulerCase::start(

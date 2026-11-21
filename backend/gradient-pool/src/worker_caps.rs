@@ -17,6 +17,33 @@ pub fn build_needs_network(kind: BuildSpecKind, is_fixed_output: bool) -> bool {
     kind != BuildSpecKind::Build || is_fixed_output
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvaluationRequirement {
+    pub eval: bool,
+    pub network: bool,
+    pub secrets: bool,
+}
+
+impl EvaluationRequirement {
+    pub fn of(job: &FlakeJob) -> Self {
+        let network = job.steps.contains(&FlakeStep::FetchFlake);
+        Self {
+            eval: job.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    FlakeStep::EvaluateFlake | FlakeStep::EvaluateDerivations
+                )
+            }),
+            network,
+            secrets: network && fetch_needs_secrets(&job.source),
+        }
+    }
+}
+
+fn fetch_needs_secrets(source: &FlakeSource) -> bool {
+    matches!(source, FlakeSource::Repository { url, .. } if check_repository_url_is_ssh(url))
+}
+
 pub fn effective_free(reported: &DeviceClass, held: u32) -> u32 {
     reported.free.min(reported.total.saturating_sub(held))
 }
@@ -106,18 +133,16 @@ impl WorkerCaps {
     }
 
     pub fn can_eval(&self, job: &FlakeJob) -> bool {
-        let needs_eval = job
-            .steps
-            .iter()
-            .any(|t| matches!(t, FlakeStep::EvaluateFlake | FlakeStep::EvaluateDerivations));
+        self.can_eval_requirement(EvaluationRequirement::of(job))
+    }
 
-        (!job.steps.contains(&FlakeStep::FetchFlake) || self.can_fetch(&job.source))
-            && (!needs_eval || self.capabilities.eval)
+    pub fn can_eval_requirement(&self, requirement: EvaluationRequirement) -> bool {
+        (!requirement.network || self.can_fetch_input(requirement.secrets))
+            && (!requirement.eval || self.capabilities.eval)
     }
 
     pub fn can_fetch(&self, source: &FlakeSource) -> bool {
-        let needs_secrets = matches!(source, FlakeSource::Repository { url, .. } if check_repository_url_is_ssh(url));
-        self.can_fetch_input(needs_secrets)
+        self.can_fetch_input(fetch_needs_secrets(source))
     }
 
     pub fn can_fetch_input(&self, needs_secrets: bool) -> bool {

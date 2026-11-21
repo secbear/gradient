@@ -77,6 +77,18 @@ pub struct ClusterBook {
 }
 
 impl ClusterBook {
+    pub(crate) fn capacity_scan_fits(&self, limit: usize) -> bool {
+        let mut remaining = limit.saturating_sub(self.waiting.capacity());
+        self.waiting.capacity() <= limit
+            && self.waiting.values().all(|cluster| {
+                if cluster.members.capacity() > remaining {
+                    return false;
+                }
+                remaining -= cluster.members.capacity();
+                true
+            })
+    }
+
     pub fn add(&mut self, of: MemberOf, key: String, job: PendingJob) {
         if self.claiming(&key) {
             return;

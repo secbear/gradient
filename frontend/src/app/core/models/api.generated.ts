@@ -302,6 +302,44 @@ export interface BoardWorker {
   exec?: ExecOffer | null;
 }
 
+export interface BootstrapCapacityAssessment {
+  observed_at: string;
+  complete: boolean;
+  demands: BootstrapCapacityDemand[];
+  profiles: BootstrapCapacityProfile[];
+  tracked_workers: BootstrapTrackedWorker[];
+}
+
+export interface BootstrapCapacityDemand {
+  kind: BootstrapDemandKind;
+  available: boolean;
+  profiles: boolean[];
+  tracked_workers: boolean[];
+}
+
+export interface BootstrapCapacityProfile {
+  profile: CapabilityProfile;
+  build_profile_index?: number | null;
+}
+
+export interface BootstrapCapacityRequest {
+  profiles: BootstrapProfileRequest[];
+  tracked_profiles?: BootstrapProfileRequest[];
+}
+
+export type BootstrapDemandKind = "download" | "substitution" | "evaluation" | "input_fetch";
+
+export interface BootstrapProfileRequest {
+  profile: CapabilityProfile;
+  registration: RegistrationCapabilities;
+}
+
+export interface BootstrapTrackedWorker {
+  profile: CapabilityProfile;
+  connected: boolean;
+  build_tracked_index?: number | null;
+}
+
 export type BuildAttemptId = string;
 
 export interface BuildAttemptLogRow {
@@ -504,12 +542,20 @@ export interface CacheTotals {
 
 export type CacheUpstreamId = string;
 
+export interface CapabilityProfile {
+  name: string;
+  worker_id: string;
+  capabilities: GradientCapabilities;
+  resources: WorkerProfile;
+}
+
 export interface CapacityAssessmentRequest {
   projects?: ProjectId[] | null;
   profiles: CapacityProfileRequest[];
   tracked_profiles?: CapacityProfileRequest[];
   include_waiting_builds?: boolean;
   build_page?: CapacityBuildPageRequest | null;
+  bootstrap?: BootstrapCapacityRequest | null;
 }
 
 export interface CapacityAssessmentResponse {
@@ -522,6 +568,7 @@ export interface CapacityAssessmentResponse {
   builds: CapacityBuild[];
   tracked_workers?: TrackedCapacityWorker[];
   build_page?: CapacityBuildPage | null;
+  bootstrap?: BootstrapCapacityAssessment | null;
 }
 
 export interface CapacityBuild {
@@ -547,6 +594,7 @@ export interface CapacityProfileRequest {
   profile: BuildCapacityProfile;
   enable_network: boolean;
   enable_build: boolean;
+  registration?: RegistrationCapabilities | null;
 }
 
 export interface CapacityWaitingBuild {
@@ -2410,6 +2458,14 @@ export interface RegisterWorkerResponse {
 export interface RegisteredTeamWorker {
   team: TeamId;
   token?: string | null;
+}
+
+export interface RegistrationCapabilities {
+  enable_build: boolean;
+  enable_network: boolean;
+  enable_eval: boolean;
+  enable_secrets: boolean;
+  enable_exec: boolean;
 }
 
 export interface RemoveMemberRequest {

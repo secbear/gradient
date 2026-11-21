@@ -17,6 +17,9 @@ use axum::{Extension, Json};
 use chrono::NaiveDateTime;
 use gradient_ci::actions::{decrypt_action_secret, encrypt_action_secret};
 use gradient_scheduler::Scheduler;
+use gradient_scheduler::bootstrap::{
+    BootstrapCapacityAssessment, BootstrapCapacityProfiles, CapabilityProfile,
+};
 use gradient_scheduler::capacity::{
     BuildCapacityAssessment, BuildCapacityCursor, BuildCapacityLimits, BuildCapacityProfile,
     BuildCapacitySnapshot, BuildProfileAssessment, BuildResourceAssessment,
@@ -63,6 +66,62 @@ pub struct CapacityProfileRequest {
     pub enable_network: bool,
     /// Whether the intended registration will permit builds.
     pub enable_build: bool,
+    /// Planned registration permissions for an optional bootstrap assessment.
+    pub registration: Option<RegistrationCapabilities>,
+}
+
+#[derive(Clone, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationCapabilities {
+    pub enable_build: bool,
+    pub enable_network: bool,
+    pub enable_eval: bool,
+    pub enable_secrets: bool,
+    pub enable_exec: bool,
+}
+
+impl RegistrationCapabilities {
+    fn apply(&self, capabilities: &mut gradient_wire::types::GradientCapabilities) {
+        capabilities.build &= self.enable_build;
+        capabilities.network &= self.enable_network;
+        capabilities.eval &= self.enable_eval;
+        capabilities.secrets &= self.enable_secrets;
+        capabilities.exec &= self.enable_exec;
+    }
+}
+
+impl From<&gradient_types::MTeamWorker> for RegistrationCapabilities {
+    fn from(worker: &gradient_types::MTeamWorker) -> Self {
+        Self {
+            enable_build: worker.enable_build,
+            enable_network: worker.enable_network,
+            enable_eval: worker.enable_eval,
+            enable_secrets: worker.enable_secrets,
+            enable_exec: worker.enable_exec,
+        }
+    }
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapProfileRequest {
+    pub profile: CapabilityProfile,
+    pub registration: RegistrationCapabilities,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapCapacityRequest {
+    pub profiles: Vec<BootstrapProfileRequest>,
+    #[serde(default)]
+    pub tracked_profiles: Vec<BootstrapProfileRequest>,
+}
+
+#[derive(Default)]
+struct AssessmentOptions {
+    include_waiting_builds: bool,
+    page: Option<(CapacityBuildPageRequest, TeamId)>,
+    bootstrap: Option<BootstrapCapacityProfiles>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -79,6 +138,8 @@ pub struct CapacityAssessmentRequest {
     pub include_waiting_builds: bool,
     /// Request queue continuation; omit to retain the oldest-build assessment.
     pub build_page: Option<CapacityBuildPageRequest>,
+    /// Include scoped capability coverage for the supported worker operations.
+    pub bootstrap: Option<BootstrapCapacityRequest>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -227,6 +288,8 @@ pub struct CapacityAssessmentResponse {
     pub tracked_workers: Vec<TrackedCapacityWorker>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_page: Option<CapacityBuildPage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<BootstrapCapacityAssessment>,
 }
 
 impl CapacityAssessmentResponse {
@@ -238,6 +301,7 @@ impl CapacityAssessmentResponse {
         build_page: Option<CapacityBuildPage>,
     ) -> Self {
         let snapshot = &assessment.snapshot;
+        let bootstrap = assessment.assess_bootstrap();
         let builds = snapshot
             .builds
             .iter()
@@ -304,6 +368,7 @@ impl CapacityAssessmentResponse {
                 })
                 .collect(),
             build_page,
+            bootstrap,
         }
     }
 }
@@ -339,8 +404,19 @@ pub async fn post_team_capacity_assessment(
     Json(body): Json<CapacityAssessmentRequest>,
 ) -> WebResult<Response> {
     let permit = admission.try_acquire()?;
-    if body.profiles.len() > MAX_PROFILES
-        || body.tracked_profiles.len() > MAX_TRACKED_PROFILES
+    let bootstrap_requested = body.bootstrap.is_some();
+    if body.profiles.len()
+        + body
+            .bootstrap
+            .as_ref()
+            .map_or(0, |bootstrap| bootstrap.profiles.len())
+        > MAX_PROFILES
+        || body.tracked_profiles.len()
+            + body
+                .bootstrap
+                .as_ref()
+                .map_or(0, |bootstrap| bootstrap.tracked_profiles.len())
+            > MAX_TRACKED_PROFILES
         || body
             .projects
             .as_ref()
@@ -349,8 +425,25 @@ pub async fn post_team_capacity_assessment(
         return Err(TeamRefusal::CapacityRequestTooLarge.into());
     }
 
+    if bootstrap_requested
+        && body
+            .profiles
+            .iter()
+            .any(|profile| profile.registration.is_none())
+    {
+        return Err(TeamRefusal::BootstrapRegistrationRequired.into());
+    }
     let profiles = requested_profiles(body.profiles)?;
     let mut tracked_profiles = requested_profiles(body.tracked_profiles)?;
+    let mut bootstrap = body
+        .bootstrap
+        .map(|bootstrap| -> WebResult<_> {
+            Ok(BootstrapCapacityProfiles {
+                profiles: requested_capability_profiles(bootstrap.profiles)?,
+                tracked_profiles: requested_capability_profiles(bootstrap.tracked_profiles)?,
+            })
+        })
+        .transpose()?;
 
     let granting: HashSet<ProjectId> =
         gradient_db::teams::workers::projects_granted_with_workers(&db.web_db, team.id)
@@ -372,8 +465,15 @@ pub async fn post_team_capacity_assessment(
     }
 
     let mut tracked_ids = HashSet::new();
-    for profile in &tracked_profiles {
-        if !tracked_ids.insert(profile.worker_id.clone()) {
+    let extra_tracked = bootstrap
+        .as_ref()
+        .map_or(&[][..], |bootstrap| bootstrap.tracked_profiles.as_slice());
+    for id in tracked_profiles
+        .iter()
+        .map(|profile| &profile.worker_id)
+        .chain(extra_tracked.iter().map(|profile| &profile.worker_id))
+    {
+        if !tracked_ids.insert(id.clone()) {
             return Err(TeamRefusal::DuplicateTrackedWorker.into());
         }
     }
@@ -383,6 +483,11 @@ pub async fn post_team_capacity_assessment(
         &tracked_profiles
             .iter()
             .map(|profile| profile.worker_id.clone())
+            .chain(
+                extra_tracked
+                    .iter()
+                    .map(|profile| profile.worker_id.clone()),
+            )
             .collect::<Vec<_>>(),
     )
     .await?
@@ -397,17 +502,41 @@ pub async fn post_team_capacity_assessment(
             return Err(TeamRefusal::TrackedWorkerCannotBuild.into());
         }
         profile.capabilities.network &= registered.enable_network;
+        if bootstrap_requested {
+            RegistrationCapabilities::from(registered).apply(&mut profile.capabilities);
+        }
+    }
+    if let Some(bootstrap) = &mut bootstrap {
+        for profile in &mut bootstrap.tracked_profiles {
+            let registered = tracked_rows
+                .get(&profile.worker_id)
+                .or_not_found(Resource::TeamWorker)?;
+            if !registered.active {
+                return Err(TeamRefusal::TrackedWorkerInactive.into());
+            }
+            RegistrationCapabilities::from(registered).apply(&mut profile.capabilities);
+        }
     }
 
     let mut checked = HashSet::new();
-    for profile in &profiles {
-        if !checked.insert(&profile.worker_id) {
+    let extra_profiles = bootstrap
+        .as_ref()
+        .map_or(&[][..], |bootstrap| bootstrap.profiles.as_slice());
+    for id in profiles
+        .iter()
+        .map(|profile| &profile.worker_id)
+        .chain(extra_profiles.iter().map(|profile| &profile.worker_id))
+    {
+        if !checked.insert(id) {
+            if bootstrap_requested {
+                return Err(TeamRefusal::DuplicateCapacityWorker.into());
+            }
             continue;
         }
-        if gradient_db::worker_registrations::by_worker_id(&db.web_db, &profile.worker_id)
+        if gradient_db::worker_registrations::by_worker_id(&db.web_db, id)
             .await?
             .is_some()
-            || gradient_db::teams::workers::is_team_worker(&db.web_db, &profile.worker_id).await?
+            || gradient_db::teams::workers::is_team_worker(&db.web_db, id).await?
         {
             return Err(TeamRefusal::WorkerIdRegistered.into());
         }
@@ -418,9 +547,12 @@ pub async fn post_team_capacity_assessment(
         projects,
         profiles,
         tracked_profiles,
-        body.include_waiting_builds,
         permit,
-        body.build_page.map(|page| (page, team.id)),
+        AssessmentOptions {
+            include_waiting_builds: body.include_waiting_builds,
+            page: body.build_page.map(|page| (page, team.id)),
+            bootstrap,
+        },
     )
     .await
 }
@@ -437,10 +569,35 @@ fn requested_profiles(
                 .to_string();
             profile.capabilities.build &= request.enable_build;
             profile.capabilities.network &= request.enable_network;
+            if let Some(registration) = request.registration {
+                registration.apply(&mut profile.capabilities);
+            }
             Ok(profile)
         })
         .collect::<WebResult<Vec<_>>>()?;
     BuildCapacityProfile::validate_all(&profiles)
+        .map_err(|err| TeamRefusal::InvalidCapacityProfile(err.to_string()))?;
+    Ok(profiles)
+}
+
+fn requested_capability_profiles(
+    requests: Vec<BootstrapProfileRequest>,
+) -> WebResult<Vec<CapabilityProfile>> {
+    let profiles = requests
+        .into_iter()
+        .map(|request| {
+            let mut profile = request.profile;
+            let worker_id =
+                Uuid::parse_str(&profile.worker_id).map_err(|_| SharedRefusal::InvalidWorkerId)?;
+            if worker_id.is_nil() {
+                return Err(SharedRefusal::InvalidWorkerId.into());
+            }
+            profile.worker_id = worker_id.to_string();
+            request.registration.apply(&mut profile.capabilities);
+            Ok(profile)
+        })
+        .collect::<WebResult<Vec<_>>>()?;
+    CapabilityProfile::validate_all(&profiles)
         .map_err(|err| TeamRefusal::InvalidCapacityProfile(err.to_string()))?;
     Ok(profiles)
 }
@@ -451,10 +608,14 @@ async fn assess_capacity(
     projects: HashSet<ProjectId>,
     profiles: Vec<BuildCapacityProfile>,
     tracked_profiles: Vec<BuildCapacityProfile>,
-    include_waiting_builds: bool,
     permit: OwnedSemaphorePermit,
-    page: Option<(CapacityBuildPageRequest, TeamId)>,
+    options: AssessmentOptions,
 ) -> WebResult<Response> {
+    let AssessmentOptions {
+        include_waiting_builds,
+        page,
+        bootstrap,
+    } = options;
     // The task owns admission even if the HTTP request is cancelled.
     let shutdown = scheduler.db.shutdown.clone();
     shutdown
@@ -469,25 +630,40 @@ async fn assess_capacity(
             } else {
                 (None, permit)
             };
-            let assessment = scheduler
-                .assess_build_capacity_page(
-                    projects,
-                    profiles.clone(),
-                    tracked_profiles.clone(),
-                    BuildCapacityLimits {
-                        builds: MAX_BUILDS,
-                        workers: MAX_WORKERS,
-                        scanned_jobs: MAX_SCANNED_JOBS,
-                        scanned_workers: MAX_SCANNED_WORKERS,
-                        assigned_jobs_per_worker: MAX_ASSIGNED_JOBS_PER_WORKER,
-                    },
-                    page.as_ref().and_then(|page| page.after),
-                )
-                .await
-                .map_err(|err| {
-                    tracing::warn!(error = %err, "capacity snapshot unavailable");
-                    unavailable()
-                })?;
+            let limits = BuildCapacityLimits {
+                builds: MAX_BUILDS,
+                workers: MAX_WORKERS,
+                scanned_jobs: MAX_SCANNED_JOBS,
+                scanned_workers: MAX_SCANNED_WORKERS,
+                assigned_jobs_per_worker: MAX_ASSIGNED_JOBS_PER_WORKER,
+            };
+            let after = page.as_ref().and_then(|page| page.after);
+            let assessment = if let Some(bootstrap) = bootstrap {
+                scheduler
+                    .assess_joint_capacity_page(
+                        projects,
+                        profiles.clone(),
+                        tracked_profiles.clone(),
+                        limits,
+                        after,
+                        bootstrap,
+                    )
+                    .await
+            } else {
+                scheduler
+                    .assess_build_capacity_page(
+                        projects,
+                        profiles.clone(),
+                        tracked_profiles.clone(),
+                        limits,
+                        after,
+                    )
+                    .await
+            }
+            .map_err(|err| {
+                tracing::warn!(error = %err, "capacity snapshot unavailable");
+                unavailable()
+            })?;
             let (response, _permit) = blocking_capacity_work(permit, move || {
                 let build_page = page
                     .map(|page| page.response(&assessment.snapshot))
@@ -556,9 +732,12 @@ mod tests {
                 HashSet::new(),
                 vec![],
                 vec![],
-                false,
                 admission.try_acquire().unwrap(),
-                paged.then_some((CapacityBuildPageRequest { after: None }, TeamId::now_v7())),
+                AssessmentOptions {
+                    page: paged
+                        .then_some((CapacityBuildPageRequest { after: None }, TeamId::now_v7())),
+                    ..Default::default()
+                },
             ));
             assert!(futures::poll!(caller.as_mut()).is_pending());
             drop(caller);
